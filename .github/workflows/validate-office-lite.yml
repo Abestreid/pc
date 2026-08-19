@@ -1,0 +1,26 @@
+name: Validate OfficeLiteOptimizer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'OfficeLiteOptimizer.ps1'
+      - '.github/workflows/validate-office-lite.yml'
+  workflow_dispatch:
+
+jobs:
+  parse:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\OfficeLiteOptimizer.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List *
+            exit 1
+          }
+          Write-Host "Windows PowerShell parser: OK"

@@ -1,10 +1,10 @@
 ﻿#requires -version 3.0
 <#
-OfficeAutoInstaller.ps1 v1.0.0
+OfficeAutoInstaller.ps1 v1.0.1
 
 Автоматический установщик Microsoft Office для Windows 10/11.
 - определяет версию Windows, архитектуру, объем RAM и язык системы;
-- не удаляет уже установленный Office;
+- не удаляет и не перезаписывает уже установленный Office;
 - загружает Office Deployment Tool с серверов Microsoft;
 - проверяет цифровую подпись Microsoft перед запуском;
 - язык Office выбирается через MatchOS с резервом en-us;
@@ -26,7 +26,7 @@ param(
     [string]$ProductId = 'Professional2024Retail'
 )
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.1'
 $SelfUrl = 'https://raw.githubusercontent.com/Abestreid/pc/main/OfficeAutoInstaller.ps1'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -61,6 +61,10 @@ function Write-Info([string]$Text) {
 
 function Write-Warn([string]$Text) {
     Write-Host "[ВНИМАНИЕ] $Text" -ForegroundColor Yellow
+}
+
+function Write-Stop([string]$Text) {
+    Write-Host "[СТОП] $Text" -ForegroundColor Yellow
 }
 
 function Write-Fail([string]$Text) {
@@ -109,7 +113,12 @@ try { Start-Transcript -Path $logPath -Force | Out-Null } catch {}
 
 function Stop-Installer([int]$Code, [string]$Message) {
     if ($Message) {
-        if ($Code -eq 0) { Write-Ok $Message } else { Write-Fail $Message }
+        switch ($Code) {
+            0  { Write-Ok $Message }
+            10 { Write-Stop $Message }
+            20 { Write-Stop $Message }
+            default { Write-Fail $Message }
+        }
     }
     Write-Info "Журнал: $logPath"
     try { Stop-Transcript | Out-Null } catch {}
@@ -163,18 +172,18 @@ function Get-SystemInfo {
 function Get-ExistingOffice {
     $items = New-Object System.Collections.ArrayList
 
+    # Не обращаемся к отсутствующему пути через Get-ItemProperty -ErrorAction Stop.
+    # Иначе Start-Transcript пишет PS>TerminatingError даже если исключение затем перехвачено.
     $c2rPaths = @(
         'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration'
     )
     foreach ($path in $c2rPaths) {
-        try {
-            $cfg = Get-ItemProperty -Path $path -ErrorAction Stop
-            if ($cfg.ProductReleaseIds) {
-                [void]$items.Add("Click-to-Run: $($cfg.ProductReleaseIds)")
-            }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $cfg = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+        if ($cfg -and $cfg.ProductReleaseIds) {
+            [void]$items.Add("Click-to-Run: $($cfg.ProductReleaseIds)")
         }
-        catch {}
     }
 
     $uninstallRoots = @(
@@ -182,16 +191,13 @@ function Get-ExistingOffice {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     foreach ($rootPath in $uninstallRoots) {
-        try {
-            Get-ItemProperty -Path $rootPath -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.DisplayName -and
-                    $_.DisplayName -match 'Microsoft (365|Office)' -and
-                    $_.DisplayName -notmatch 'Update|Language Pack|Proofing|Click-to-Run Extensibility'
-                } |
-                ForEach-Object { [void]$items.Add([string]$_.DisplayName) }
-        }
-        catch {}
+        Get-ItemProperty -Path $rootPath -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.DisplayName -and
+                $_.DisplayName -match 'Microsoft (365|Office)' -and
+                $_.DisplayName -notmatch 'Update|Language Pack|Proofing|Click-to-Run Extensibility'
+            } |
+            ForEach-Object { [void]$items.Add([string]$_.DisplayName) }
     }
 
     $wordCandidates = @(
@@ -201,7 +207,7 @@ function Get-ExistingOffice {
         $wordCandidates += (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Office\root\Office16\WINWORD.EXE')
     }
     foreach ($candidate in $wordCandidates) {
-        if (Test-Path $candidate) { [void]$items.Add("Word: $candidate") }
+        if (Test-Path -LiteralPath $candidate) { [void]$items.Add("Word: $candidate") }
     }
 
     return @($items | Select-Object -Unique)
@@ -220,7 +226,7 @@ function Test-MicrosoftSignature([string]$Path) {
 function Download-File([string]$Url, [string]$Destination) {
     Write-Info "Скачивание: $Url"
     $wc = New-Object Net.WebClient
-    $wc.Headers['User-Agent'] = 'Mozilla/5.0 OfficeAutoInstaller/1.0'
+    $wc.Headers['User-Agent'] = "Mozilla/5.0 OfficeAutoInstaller/$ScriptVersion"
     $wc.DownloadFile($Url, $Destination)
 }
 
@@ -234,7 +240,7 @@ function Resolve-OdtPackageUrl {
     foreach ($page in $pages) {
         try {
             $wc = New-Object Net.WebClient
-            $wc.Headers['User-Agent'] = 'Mozilla/5.0 OfficeAutoInstaller/1.0'
+            $wc.Headers['User-Agent'] = "Mozilla/5.0 OfficeAutoInstaller/$ScriptVersion"
             $html = $wc.DownloadString($page)
             try { $html = [Net.WebUtility]::HtmlDecode($html) } catch {}
             $match = [regex]::Match($html, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -262,7 +268,7 @@ function Get-OdtSetup([string]$Directory) {
             if ($p.ExitCode -ne 0) {
                 throw "Распаковка ODT завершилась с кодом $($p.ExitCode)."
             }
-            if (Test-Path $setupPath) {
+            if (Test-Path -LiteralPath $setupPath) {
                 if (-not (Test-MicrosoftSignature $setupPath)) {
                     throw 'Цифровая подпись setup.exe ODT не прошла проверку.'
                 }
@@ -313,7 +319,7 @@ function Find-OfficeApplications {
         $found = $false
         foreach ($base in $roots) {
             $path = Join-Path $base ("Microsoft Office\root\Office16\" + $app.File)
-            if (Test-Path $path) {
+            if (Test-Path -LiteralPath $path) {
                 [void]$result.Add("$($app.Name): $path")
                 $found = $true
                 break
@@ -360,7 +366,7 @@ if ($existing.Count -gt 0) {
     Write-Title 'Office уже обнаружен'
     foreach ($item in $existing) { Write-Host " - $item" }
     Write-Warn 'Чтобы не повредить существующую лицензию и профиль Office, автоматическая переустановка отменена.'
-    [void](Stop-Installer 10 'Изменения не выполнялись.')
+    [void](Stop-Installer 10 'Изменения не выполнялись. Это штатная защитная остановка.')
     return
 }
 

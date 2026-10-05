@@ -1,1266 +1,856 @@
-﻿#requires -Version 5.1
+﻿#requires -version 3.0
 <#
-PC Direct Folder Transfer
-Windows 10 / Windows 11
+DirectFolderTransfer.ps1 v2.0.0
 
-Сценарий:
-- Получатель запускает режим 2 и выбирает папку назначения.
-- Отправитель запускает режим 1, выбирает папки/файлы.
-- Отправитель автоматически находит получателя среди Tailscale-устройств.
-- Паролей, токенов и кодов подключения нет.
+Прямая передача папок и файлов с одного Windows 10/11 ПК на другой через интернет.
+- ничего не устанавливает, без регистраций и сторонних программ - только PowerShell;
+- передает все вложенные папки и файлы (включая пустые папки), структура сохраняется;
+- файлы любого размера (больше 4 GB тоже);
+- после обрыва сам переподключается и докачивает с того же места;
+- повторный запуск пропускает уже полностью переданные файлы;
+- сам открывает порт в Windows Firewall и на роутере (UPnP), после работы закрывает;
+- доступ защищен PIN-кодом из кода подключения.
+
+Получатель: пункт 2 -> папка (Enter = Downloads\Torrents) -> отправить код второй стороне.
+Отправитель: пункт 1 -> перетащить папки -> вставить код.
+Если не соединяется: на отправителе пункт 3, на получателе пункт 4 (меняется, кто ждет подключения).
+
+Примеры без меню:
+  .\DirectFolderTransfer.ps1 -Mode Receive -Dest 'C:\Users\owner\Downloads\Torrents'
+  .\DirectFolderTransfer.ps1 -Mode Send -Paths 'D:\Soft\Photoshop.2021' -Code '1.2.3.4:42873:123456'
 #>
 
 [CmdletBinding()]
 param(
-    [ValidateSet("Menu","Sender","Receiver")]
-    [string]$Mode = "Menu",
-    [string[]]$Source,
-    [string]$Destination,
-    [int]$Port = 42873
+    [ValidateSet('Menu', 'Send', 'Receive')]
+    [string]$Mode = 'Menu',
+    [switch]$Listen,
+    [string[]]$Paths,
+    [string]$Dest,
+    [string]$Code,
+    [int]$Port = 42873,
+    [string]$Pin,
+    [switch]$Local,
+    [switch]$NoAdmin
 )
 
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = "Stop"
-
-$ProtocolVersion = 2
+$ScriptVersion = '2.0.0'
+$SelfUrl = 'https://raw.githubusercontent.com/Abestreid/pc/main/DirectFolderTransfer.ps1'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$Magic = 'DFT2'
 $BufferSize = 1MB
-$FirewallRule = $null
-$LogFile = $null
+$RuleName = "DirectFolderTransfer-$Port"
+$LogFile = Join-Path $env:TEMP 'DirectFolderTransfer.log'
 
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {
+    try { [Net.ServicePointManager]::SecurityProtocol = 3072 } catch {}
+}
+
+# Windows PowerShell 5.1 корректно читает кириллицу из UTF-8 BOM.
+try { & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null } catch {}
+try {
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [Console]::InputEncoding = $utf8
+    [Console]::OutputEncoding = $utf8
+    $global:OutputEncoding = $utf8
+} catch {}
+
+function Write-Title([string]$Text) {
+    Write-Host "`n============================================================" -ForegroundColor DarkCyan
+    Write-Host " $Text" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+}
+function Write-Ok([string]$Text)   { Write-Host "[OK] $Text" -ForegroundColor Green }
 function Write-Info([string]$Text) { Write-Host "[INFO] $Text" -ForegroundColor Cyan }
-function Write-Ok([string]$Text)   { Write-Host "[OK]   $Text" -ForegroundColor Green }
-function Write-Warn([string]$Text) { Write-Host "[WARN] $Text" -ForegroundColor Yellow }
+function Write-Warn([string]$Text) { Write-Host "[ВНИМАНИЕ] $Text" -ForegroundColor Yellow }
+function Write-Fail([string]$Text) { Write-Host "[ОШИБКА] $Text" -ForegroundColor Red }
 
-function Init-Log {
-    $dir = Join-Path $env:LOCALAPPDATA "PCDirectTransfer\logs"
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $script:LogFile = Join-Path $dir ("transfer-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+function Write-Log([string]$Text) {
+    try { Add-Content -LiteralPath $LogFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $Text) -Encoding UTF8 } catch {}
 }
 
-function Log([string]$Text) {
-    if ($script:LogFile) {
-        Add-Content -LiteralPath $script:LogFile -Value ("{0:u} {1}" -f (Get-Date), $Text) -Encoding UTF8
+function Test-Admin {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch { return $false }
+}
+
+# Админ нужен только чтобы открыть порт в Windows Firewall.
+# При запуске однострочной командой файла на диске еще нет - для UAC повторно загружаем скрипт из GitHub.
+if (-not $NoAdmin -and -not (Test-Admin)) {
+    Write-Warn 'Требуются права администратора (открыть порт в Windows Firewall). Сейчас появится запрос UAC.'
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($PSCommandPath) {
+        $argList = "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    }
+    else {
+        $payload = @"
+[Net.ServicePointManager]::SecurityProtocol = 3072
+`$client = New-Object Net.WebClient
+`$client.Encoding = [Text.Encoding]::UTF8
+`$source = `$client.DownloadString('$SelfUrl')
+`$script = [ScriptBlock]::Create(`$source)
+& `$script
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+        $argList = "-NoExit -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    }
+    try {
+        Start-Process -FilePath $ps -Verb RunAs -ArgumentList $argList | Out-Null
+        return
+    }
+    catch {
+        Write-Warn "Без прав администратора. Если Windows спросит про доступ к сети - нажмите 'Разрешить'."
+        $NoAdmin = $true
     }
 }
 
-function Is-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($id)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# Ошибка, после которой повторять бессмысленно (неверный PIN, мало места и т.п.)
+function New-FatalError([string]$Message) { return (New-Object ApplicationException($Message)) }
+
+# ---------------------------------------------------------------- утилиты
+
+function Format-Size([double]$Bytes) {
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
+    return ('{0:N0} B' -f $Bytes)
 }
 
-function Restart-ReceiverAsAdmin {
-    if (-not $PSCommandPath) {
-        throw "Не удалось определить путь к скрипту для перезапуска."
-    }
-
-    Write-Warn "Для получателя нужны права администратора для временного правила Windows Firewall."
-    Write-Info "Подтвердите запрос UAC."
-
-    $args = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", ('"{0}"' -f $PSCommandPath),
-        "-Mode", "Receiver",
-        "-Port", $Port
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($Destination)) {
-        $args += @("-Destination", ('"{0}"' -f $Destination))
-    }
-
-    Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList ($args -join " ")
-    exit
+function Format-Eta([double]$Seconds) {
+    if ($Seconds -lt 0 -or [double]::IsInfinity($Seconds) -or [double]::IsNaN($Seconds)) { return '--:--:--' }
+    $t = [TimeSpan]::FromSeconds([Math]::Min($Seconds, 359999))
+    return ('{0:00}:{1:00}:{2:00}' -f [Math]::Floor($t.TotalHours), $t.Minutes, $t.Seconds)
 }
 
-function Find-Tailscale {
-    $cmd = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-    if ($cmd) {
-        return $cmd.Source
+$script:ProgressLast = 0
+$script:SessionBytes = 0
+function Show-Progress([long]$Done, [long]$Total, [Diagnostics.Stopwatch]$Watch, [string]$Name, [switch]$Force) {
+    $now = $Watch.ElapsedMilliseconds
+    if (-not $Force -and ($now - $script:ProgressLast) -lt 500) { return }
+    $script:ProgressLast = $now
+    $sec = [Math]::Max($Watch.Elapsed.TotalSeconds, 0.001)
+    $speed = $script:SessionBytes / $sec
+    $pct = 100.0
+    if ($Total -gt 0) { $pct = $Done * 100.0 / $Total }
+    $eta = -1
+    if ($speed -gt 0) { $eta = ($Total - $Done) / $speed }
+    $line = '[{0,5:N1}%] {1} / {2}  {3}/s  осталось {4}  {5}' -f $pct, (Format-Size $Done), (Format-Size $Total), (Format-Size $speed), (Format-Eta $eta), $Name
+    $width = 119
+    try { $width = [Console]::WindowWidth - 1 } catch {}
+    if ($width -lt 40) { $width = 79 }
+    if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
+    Write-Host ("`r" + $line.PadRight($width)) -NoNewline
+}
+
+function Get-CleanPaths([string]$Line) {
+    # Перетаскивание в окно PowerShell дает "путь в кавычках"; можно перетащить несколько сразу.
+    $result = @()
+    if ($Line -match '"') {
+        foreach ($m in [regex]::Matches($Line, '"([^"]+)"')) { $result += $m.Groups[1].Value.Trim() }
     }
-
-    $paths = @(
-        (Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"),
-        (Join-Path $env:LOCALAPPDATA "Tailscale\tailscale.exe")
-    )
-
-    foreach ($path in $paths) {
-        if (Test-Path -LiteralPath $path) {
-            return $path
-        }
+    elseif ($Line -match "^\s*&?\s*'") {
+        foreach ($m in [regex]::Matches($Line, "'([^']+)'")) { $result += $m.Groups[1].Value.Trim() }
     }
+    else {
+        $t = $Line.Trim().TrimStart('&').Trim()
+        if ($t) { $result += $t }
+    }
+    return , $result
+}
 
+function Get-HttpText([string]$Url, [int]$TimeoutMs = 6000) {
+    try {
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.Timeout = $TimeoutMs
+        $req.ReadWriteTimeout = $TimeoutMs
+        $req.UserAgent = 'DirectFolderTransfer'
+        $resp = $req.GetResponse()
+        try { return (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd().Trim() }
+        finally { $resp.Close() }
+    }
+    catch { return $null }
+}
+
+function Test-PrivateIPv4([string]$Ip) {
+    $a = $null
+    if (-not [Net.IPAddress]::TryParse($Ip, [ref]$a)) { return $true }
+    $b = $a.GetAddressBytes()
+    if ($b.Length -ne 4) { return $false }
+    if ($b[0] -eq 10 -or $b[0] -eq 127 -or $b[0] -eq 0) { return $true }
+    if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return $true }
+    if ($b[0] -eq 192 -and $b[1] -eq 168) { return $true }
+    if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) { return $true }
+    if ($b[0] -eq 169 -and $b[1] -eq 254) { return $true }
+    return $false
+}
+
+function Get-PublicIPv4 {
+    foreach ($u in 'https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://ifconfig.me/ip') {
+        $t = Get-HttpText $u
+        $a = $null
+        if ($t -and [Net.IPAddress]::TryParse($t, [ref]$a) -and $a.AddressFamily -eq 'InterNetwork') { return $t }
+    }
     return $null
 }
 
-function Install-Tailscale {
-    Write-Warn "Tailscale не установлен."
-    $answer = Read-Host "Установить Tailscale автоматически? [Y/n]"
-    if ($answer -and $answer -notmatch '^(y|yes|д|да)$') {
-        throw "Без Tailscale передача не запускается."
+function Get-PublicIPv6 {
+    foreach ($u in 'https://api6.ipify.org', 'https://ipv6.icanhazip.com') {
+        $t = Get-HttpText $u 4000
+        $a = $null
+        if ($t -and [Net.IPAddress]::TryParse($t, [ref]$a) -and $a.AddressFamily -eq 'InterNetworkV6') { return $t }
     }
-
-    $installer = Join-Path $env:TEMP "tailscale-setup.exe"
-
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Write-Info "Определяю актуальный официальный установщик Tailscale..."
-
-        $page = Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/" -UseBasicParsing
-        $matches = [regex]::Matches($page.Content, 'href="(tailscale-setup-(\d+\.\d+\.\d+)\.exe)"')
-
-        if ($matches.Count -eq 0) {
-            throw "Не удалось найти установщик Tailscale."
-        }
-
-        $items = foreach ($match in $matches) {
-            [pscustomobject]@{
-                File = $match.Groups[1].Value
-                Version = [version]$match.Groups[2].Value
-            }
-        }
-
-        $latest = $items | Sort-Object Version -Descending | Select-Object -First 1
-        $url = "https://pkgs.tailscale.com/stable/" + $latest.File
-
-        Write-Info "Скачиваю Tailscale $($latest.Version)..."
-        Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
-
-        Write-Info "Запускаю установщик..."
-        $proc = Start-Process -FilePath $installer -Verb RunAs -PassThru -Wait
-        if ($proc.ExitCode -ne 0) {
-            Write-Warn "Установщик завершился с кодом $($proc.ExitCode)."
-        }
-    }
-    finally {
-        if (Test-Path -LiteralPath $installer) {
-            Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    Start-Sleep -Seconds 2
-
-    $exe = Find-Tailscale
-    if (-not $exe) {
-        throw "Tailscale не найден после установки."
-    }
-
-    return $exe
+    return $null
 }
 
-function Ensure-Tailscale {
-    $exe = Find-Tailscale
+# ---------------------------------------------------------------- UPnP: проброс порта на роутере без захода в роутер
 
-    if (-not $exe) {
-        $exe = Install-Tailscale
-    }
+$script:Upnp = $null
 
-    Write-Ok "Tailscale найден."
-    return $exe
+function Invoke-UpnpSoap([string]$ControlUrl, [string]$ServiceType, [string]$Action, [string]$Body) {
+    $xml = '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>' +
+        "<u:$Action xmlns:u=`"$ServiceType`">$Body</u:$Action></s:Body></s:Envelope>"
+    $bytes = [Text.Encoding]::UTF8.GetBytes($xml)
+    $req = [Net.HttpWebRequest]::Create($ControlUrl)
+    $req.Method = 'POST'
+    $req.Timeout = 6000
+    $req.ContentType = 'text/xml; charset="utf-8"'
+    $req.Headers.Add('SOAPAction', "`"$ServiceType#$Action`"")
+    $req.ContentLength = $bytes.Length
+    $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
+    $resp = $req.GetResponse()
+    try { return (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } finally { $resp.Close() }
 }
 
-function Get-TailscaleIPv4([string]$Exe) {
-    $ip = $null
-
+function Find-UpnpGateway {
+    $locations = @()
+    $udp = New-Object Net.Sockets.UdpClient(0)
     try {
-        $ip = (& $Exe ip -4 2>$null | Select-Object -First 1)
-    }
-    catch {}
-
-    if ([string]::IsNullOrWhiteSpace($ip)) {
-        Write-Warn "Этот компьютер еще не подключен к Tailscale."
-        Write-Info "Откроется авторизация. На обоих компьютерах войдите в одну Tailscale-сеть."
-        & $Exe up
-
-        for ($i = 0; $i -lt 90; $i++) {
-            Start-Sleep -Seconds 2
-
+        $udp.Client.ReceiveTimeout = 1000
+        $target = New-Object Net.IPEndPoint([Net.IPAddress]::Parse('239.255.255.250'), 1900)
+        foreach ($st in 'urn:schemas-upnp-org:device:InternetGatewayDevice:1', 'urn:schemas-upnp-org:service:WANIPConnection:1', 'urn:schemas-upnp-org:service:WANPPPConnection:1', 'urn:schemas-upnp-org:device:InternetGatewayDevice:2') {
+            $msg = "M-SEARCH * HTTP/1.1`r`nHOST: 239.255.255.250:1900`r`nMAN: `"ssdp:discover`"`r`nMX: 2`r`nST: $st`r`n`r`n"
+            $b = [Text.Encoding]::ASCII.GetBytes($msg)
+            [void]$udp.Send($b, $b.Length, $target)
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds(3)
+        while ([DateTime]::UtcNow -lt $deadline) {
             try {
-                $ip = (& $Exe ip -4 2>$null | Select-Object -First 1)
+                $ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
+                $data = $udp.Receive([ref]$ep)
+                $text = [Text.Encoding]::ASCII.GetString($data)
+                if ($text -match '(?im)^LOCATION:\s*(\S+)') {
+                    if ($locations -notcontains $Matches[1]) { $locations += $Matches[1] }
+                }
             }
             catch {}
+        }
+    }
+    finally { $udp.Close() }
 
-            if (-not [string]::IsNullOrWhiteSpace($ip)) {
-                break
+    foreach ($loc in $locations) {
+        $desc = Get-HttpText $loc 5000
+        if (-not $desc) { continue }
+        try { [xml]$x = $desc } catch { continue }
+        $base = $loc
+        $ub = $x.GetElementsByTagName('URLBase')
+        if ($ub.Count -gt 0 -and $ub[0].InnerText) { $base = $ub[0].InnerText }
+        foreach ($svc in $x.GetElementsByTagName('service')) {
+            $type = [string]$svc.serviceType
+            if ($type -match 'WANIPConnection|WANPPPConnection') {
+                $ctrl = (New-Object Uri((New-Object Uri($base)), [string]$svc.controlURL)).AbsoluteUri
+                $u = New-Object Uri($loc)
+                # Свой локальный IP в сторону роутера
+                $s = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Dgram, [Net.Sockets.ProtocolType]::Udp)
+                try { $s.Connect($u.Host, 1900); $localIp = $s.LocalEndPoint.Address.ToString() } finally { $s.Close() }
+                return @{ Control = $ctrl; Type = $type; LocalIp = $localIp; External = $null }
             }
         }
     }
-
-    if ([string]::IsNullOrWhiteSpace($ip)) {
-        throw "Не удалось получить Tailscale IPv4."
-    }
-
-    return $ip.Trim()
+    return $null
 }
 
-function Format-Size([int64]$Bytes) {
-    if ($Bytes -ge 1TB) { return ("{0:N2} TB" -f ($Bytes / 1TB)) }
-    if ($Bytes -ge 1GB) { return ("{0:N2} GB" -f ($Bytes / 1GB)) }
-    if ($Bytes -ge 1MB) { return ("{0:N2} MB" -f ($Bytes / 1MB)) }
-    if ($Bytes -ge 1KB) { return ("{0:N2} KB" -f ($Bytes / 1KB)) }
-    return "$Bytes B"
-}
-
-function Read-Exactly {
-    param(
-        [System.IO.Stream]$Stream,
-        [byte[]]$Buffer,
-        [int]$Count
-    )
-
-    $read = 0
-
-    while ($read -lt $Count) {
-        $n = $Stream.Read($Buffer, $read, $Count - $read)
-
-        if ($n -le 0) {
-            throw "Соединение закрыто удаленным компьютером."
+function Open-UpnpPort([int]$P) {
+    try {
+        $gw = Find-UpnpGateway
+        if (-not $gw) {
+            Write-Warn 'Роутер не ответил по UPnP - порт на роутере открыть не удалось.'
+            Write-Warn 'Если вторая сторона не подключится: поменяйтесь ролями (пункты 3/4) или включите UPnP в настройках роутера.'
+            return $null
         }
-
-        $read += $n
+        try {
+            $r = Invoke-UpnpSoap $gw.Control $gw.Type 'GetExternalIPAddress' ''
+            if ($r -match '<NewExternalIPAddress>([^<]*)<') { $gw.External = $Matches[1] }
+        } catch {}
+        $del = "<NewRemoteHost></NewRemoteHost><NewExternalPort>$P</NewExternalPort><NewProtocol>TCP</NewProtocol>"
+        try { Invoke-UpnpSoap $gw.Control $gw.Type 'DeletePortMapping' $del | Out-Null } catch {}
+        $ok = $false
+        foreach ($lease in 0, 86400) {
+            try {
+                $body = "<NewRemoteHost></NewRemoteHost><NewExternalPort>$P</NewExternalPort><NewProtocol>TCP</NewProtocol><NewInternalPort>$P</NewInternalPort>" +
+                    "<NewInternalClient>$($gw.LocalIp)</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>DirectFolderTransfer</NewPortMappingDescription><NewLeaseDuration>$lease</NewLeaseDuration>"
+                Invoke-UpnpSoap $gw.Control $gw.Type 'AddPortMapping' $body | Out-Null
+                $ok = $true; break
+            } catch { Write-Log "UPnP AddPortMapping lease=$lease : $($_.Exception.Message)" }
+        }
+        if (-not $ok) { Write-Warn 'Роутер отказал в пробросе порта по UPnP.'; return $null }
+        $script:Upnp = $gw
+        Write-Ok "Порт $P открыт на роутере (UPnP). Внешний IP роутера: $($gw.External)"
+        return $gw
     }
-}
-
-function Send-Json {
-    param(
-        [System.IO.Stream]$Stream,
-        $Object
-    )
-
-    $json = $Object | ConvertTo-Json -Compress -Depth 8
-    $payload = [Text.Encoding]::UTF8.GetBytes($json)
-
-    if ($payload.Length -gt 8MB) {
-        throw "Слишком большое служебное сообщение."
-    }
-
-    $len = [BitConverter]::GetBytes([int]$payload.Length)
-
-    if ([BitConverter]::IsLittleEndian) {
-        [Array]::Reverse($len)
-    }
-
-    $Stream.Write($len, 0, 4)
-    $Stream.Write($payload, 0, $payload.Length)
-    $Stream.Flush()
-}
-
-function Receive-Json {
-    param([System.IO.Stream]$Stream)
-
-    $len = New-Object byte[] 4
-    Read-Exactly -Stream $Stream -Buffer $len -Count 4
-
-    if ([BitConverter]::IsLittleEndian) {
-        [Array]::Reverse($len)
-    }
-
-    $count = [BitConverter]::ToInt32($len, 0)
-
-    if ($count -lt 2 -or $count -gt 8MB) {
-        throw "Некорректное служебное сообщение."
-    }
-
-    $payload = New-Object byte[] $count
-    Read-Exactly -Stream $Stream -Buffer $payload -Count $count
-
-    return ([Text.Encoding]::UTF8.GetString($payload) | ConvertFrom-Json)
-}
-
-function Normalize-DraggedPath([string]$Path) {
-    if ($null -eq $Path) {
+    catch {
+        Write-Log "UPnP: $($_.Exception.Message)"
+        Write-Warn 'UPnP не сработал.'
         return $null
     }
-
-    return $Path.Trim().Trim('"').Trim("'")
 }
 
-function Get-Entries([string[]]$Paths) {
-    $result = New-Object System.Collections.ArrayList
+function Close-UpnpPort([int]$P) {
+    if (-not $script:Upnp) { return }
+    $del = "<NewRemoteHost></NewRemoteHost><NewExternalPort>$P</NewExternalPort><NewProtocol>TCP</NewProtocol>"
+    try { Invoke-UpnpSoap $script:Upnp.Control $script:Upnp.Type 'DeletePortMapping' $del | Out-Null } catch {}
+    $script:Upnp = $null
+}
 
-    foreach ($raw in $Paths) {
-        $path = Normalize-DraggedPath $raw
+# ---------------------------------------------------------------- Windows Firewall
 
-        if ([string]::IsNullOrWhiteSpace($path)) {
-            continue
-        }
+$script:RuleAdded = $false
+function Open-FirewallPort([int]$P) {
+    if ($NoAdmin -or -not (Test-Admin)) { return }
+    & netsh advfirewall firewall delete rule name="$RuleName" | Out-Null
+    & netsh advfirewall firewall add rule name="$RuleName" dir=in action=allow protocol=TCP localport=$P profile=any | Out-Null
+    if ($LASTEXITCODE -eq 0) { $script:RuleAdded = $true; Write-Ok "Порт $P открыт в Windows Firewall (временно)." }
+    else { Write-Warn 'Не удалось добавить правило Windows Firewall.' }
+}
+function Close-FirewallPort {
+    if ($script:RuleAdded) { & netsh advfirewall firewall delete rule name="$RuleName" | Out-Null; $script:RuleAdded = $false }
+}
 
-        if (-not (Test-Path -LiteralPath $path)) {
-            throw "Путь не найден: $path"
-        }
+# ---------------------------------------------------------------- сбор файлов (отправитель)
 
-        $rootItem = Get-Item -LiteralPath $path -Force
-
-        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Write-Warn "Пропущена ссылка/reparse point: $($rootItem.FullName)"
-            continue
-        }
-
-        if (-not $rootItem.PSIsContainer) {
-            [void]$result.Add([pscustomobject]@{
-                Kind = "File"
-                Local = $rootItem.FullName
-                Relative = $rootItem.Name
-                Length = [int64]$rootItem.Length
-                Ticks = [int64]$rootItem.LastWriteTimeUtc.Ticks
-            })
-
-            continue
-        }
-
-        $root = $rootItem.FullName.TrimEnd("\")
-        $rootName = Split-Path -Leaf $root
-
-        [void]$result.Add([pscustomobject]@{
-            Kind = "Directory"
-            Local = $root
-            Relative = $rootName
-            Length = [int64]0
-            Ticks = [int64]$rootItem.LastWriteTimeUtc.Ticks
-        })
-
-        $children = Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop
-
-        foreach ($item in $children) {
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                Write-Warn "Пропущена ссылка/reparse point: $($item.FullName)"
-                continue
+function Get-Manifest([string[]]$Roots) {
+    $files = New-Object Collections.ArrayList
+    $dirs = New-Object Collections.ArrayList
+    $seen = @{}
+    $errors = New-Object Collections.ArrayList
+    foreach ($root in $Roots) {
+        $full = [IO.Path]::GetFullPath($root)
+        if ([IO.File]::Exists($full)) {
+            $fi = New-Object IO.FileInfo($full)
+            if (-not $seen.ContainsKey($fi.Name)) {
+                $seen[$fi.Name] = 1
+                [void]$files.Add(@{ Rel = $fi.Name; Full = $fi.FullName; Size = $fi.Length; Time = $fi.LastWriteTimeUtc.Ticks })
             }
-
-            $relativeInside = $item.FullName.Substring($root.Length).TrimStart("\")
-            $relative = Join-Path $rootName $relativeInside
-
-            if ($item.PSIsContainer) {
-                [void]$result.Add([pscustomobject]@{
-                    Kind = "Directory"
-                    Local = $item.FullName
-                    Relative = $relative
-                    Length = [int64]0
-                    Ticks = [int64]$item.LastWriteTimeUtc.Ticks
-                })
-            }
-            else {
-                [void]$result.Add([pscustomobject]@{
-                    Kind = "File"
-                    Local = $item.FullName
-                    Relative = $relative
-                    Length = [int64]$item.Length
-                    Ticks = [int64]$item.LastWriteTimeUtc.Ticks
-                })
+            continue
+        }
+        $di = New-Object IO.DirectoryInfo($full)
+        $name = $di.Name.TrimEnd('\')
+        if ($null -eq $di.Parent) { $name = 'Disk_' + $di.FullName.Substring(0, 1) }
+        $stack = New-Object Collections.Stack
+        $stack.Push(@($di, $name))
+        while ($stack.Count -gt 0) {
+            $item = $stack.Pop()
+            $d = $item[0]; $relDir = $item[1]
+            [void]$dirs.Add($relDir)
+            try { $entries = $d.GetFileSystemInfos() }
+            catch { [void]$errors.Add("$($d.FullName): $($_.Exception.Message)"); continue }
+            foreach ($e in $entries) {
+                $rel = $relDir + '\' + $e.Name
+                if ($e -is [IO.DirectoryInfo]) {
+                    # Ссылки/джанкшены не обходим, чтобы не зациклиться
+                    if (($e.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $stack.Push(@($e, $rel))
+                }
+                elseif (-not $seen.ContainsKey($rel)) {
+                    $seen[$rel] = 1
+                    [void]$files.Add(@{ Rel = $rel; Full = $e.FullName; Size = $e.Length; Time = $e.LastWriteTimeUtc.Ticks })
+                }
             }
         }
     }
-
-    return ,$result
+    foreach ($er in $errors) { Write-Warn "Нет доступа: $er"; Write-Log "SCAN $er" }
+    return @{ Files = $files; Dirs = $dirs }
 }
 
-function Get-SafePath {
-    param(
-        [string]$Root,
-        [string]$Relative
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Relative)) {
-        throw "Получен пустой путь."
-    }
-
-    $rel = $Relative.Replace("/", "\")
-
-    if ([IO.Path]::IsPathRooted($rel)) {
-        throw "Заблокирован абсолютный удаленный путь."
-    }
-
-    $base = [IO.Path]::GetFullPath($Root).TrimEnd("\") + "\"
-    $full = [IO.Path]::GetFullPath((Join-Path $base $rel))
-
-    if (-not $full.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Заблокирован выход за пределы папки назначения."
-    }
-
-    return $full
-}
-
-function Get-FreeBytes([string]$Path) {
-    $full = [IO.Path]::GetFullPath($Path)
-    $root = [IO.Path]::GetPathRoot($full)
-    $drive = New-Object IO.DriveInfo($root)
-
-    return [int64]$drive.AvailableFreeSpace
-}
-
-function Add-TemporaryFirewallRule {
-    param(
-        [string]$Ip,
-        [int]$ListenPort
-    )
-
-    if (-not (Is-Admin)) {
-        throw "Для получателя нужны права администратора."
-    }
-
-    $name = "PC Direct Transfer $Ip $ListenPort"
-
-    Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue |
-        Remove-NetFirewallRule -ErrorAction SilentlyContinue
-
-    $firewallArgs = @{
-        DisplayName = $name
-        Direction = "Inbound"
-        Action = "Allow"
-        Protocol = "TCP"
-        LocalAddress = $Ip
-        LocalPort = $ListenPort
-        RemoteAddress = "100.64.0.0/10"
-        Profile = "Any"
-    }
-
-    New-NetFirewallRule @firewallArgs | Out-Null
-
-    $script:FirewallRule = $name
-    Write-Ok "Windows Firewall настроен для Tailscale TCP/$ListenPort."
-}
-
-function Remove-TemporaryFirewallRule {
-    if ($script:FirewallRule) {
-        Get-NetFirewallRule -DisplayName $script:FirewallRule -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
-
-        $script:FirewallRule = $null
-    }
-}
-
-function Get-TailscalePeers([string]$Exe) {
-    $jsonText = (& $Exe status --json 2>$null | Out-String)
-
-    if ([string]::IsNullOrWhiteSpace($jsonText)) {
-        throw "Tailscale не вернул список устройств."
-    }
-
-    $status = $jsonText | ConvertFrom-Json
-    $result = New-Object System.Collections.ArrayList
-
-    if ($null -eq $status.Peer) {
-        return @()
-    }
-
-    foreach ($property in $status.Peer.PSObject.Properties) {
-        $peer = $property.Value
-
-        if ($peer.Online -ne $true) {
+function Read-SourcePaths {
+    $list = @()
+    Write-Host ''
+    Write-Host 'Перетащите папку (или файл) в это окно либо вставьте путь и нажмите Enter.' -ForegroundColor White
+    Write-Host 'Можно добавить несколько. Когда всё добавлено - просто нажмите Enter.' -ForegroundColor Gray
+    while ($true) {
+        $prompt = 'Путь'
+        if ($list.Count -gt 0) { $prompt = 'Ещё путь (Enter = готово)' }
+        $line = Read-Host $prompt
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            if ($list.Count -gt 0) { break }
             continue
         }
+        foreach ($p in (Get-CleanPaths $line)) {
+            if (Test-Path -LiteralPath $p) {
+                $fp = (Resolve-Path -LiteralPath $p).ProviderPath
+                if ($list -notcontains $fp) { $list += $fp; Write-Ok "Добавлено: $fp" }
+            }
+            else { Write-Fail "Не найдено: $p" }
+        }
+    }
+    return , $list
+}
 
-        $ip = $null
+# ---------------------------------------------------------------- сессии передачи
+# Протокол: манифест (папки, файлы, размеры) -> получатель отвечает, сколько байт каждого файла у него уже есть
+# -> отправитель досылает только недостающее. Поэтому обрыв = просто новая сессия с того же места.
 
-        foreach ($candidate in @($peer.TailscaleIPs)) {
-            if ([string]$candidate -match '^100\.') {
-                $ip = [string]$candidate
-                break
+function Invoke-SendSession([IO.Stream]$Net, $Manifest, [long]$TotalAll) {
+    $w = New-Object IO.BinaryWriter($Net, [Text.Encoding]::UTF8)
+    $r = New-Object IO.BinaryReader($Net, [Text.Encoding]::UTF8)
+    $files = $Manifest.Files
+
+    $w.Write([int]$Manifest.Dirs.Count)
+    foreach ($d in $Manifest.Dirs) { $w.Write([string]$d) }
+    $w.Write([int]$files.Count)
+    foreach ($f in $files) { $w.Write([string]$f.Rel); $w.Write([long]$f.Size); $w.Write([long]$f.Time) }
+    $w.Flush()
+
+    $ok = $r.ReadBoolean()
+    $msg = $r.ReadString()
+    if (-not $ok) { throw (New-FatalError "Получатель отказал: $msg") }
+    if ($msg) { Write-Info $msg }
+    $offsets = New-Object 'long[]' $files.Count
+    for ($i = 0; $i -lt $files.Count; $i++) { $offsets[$i] = $r.ReadInt64() }
+
+    $done = [long]0
+    foreach ($o in $offsets) { $done += $o }
+    if ($done -gt 0) { Write-Info ("Уже есть у получателя: {0} - продолжаю с этого места." -f (Format-Size $done)) }
+
+    $buf = New-Object byte[] $BufferSize
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $script:SessionBytes = 0
+    $failed = New-Object Collections.ArrayList
+    for ($i = 0; $i -lt $files.Count; $i++) {
+        $f = $files[$i]
+        $off = $offsets[$i]
+        if ($off -ge $f.Size) { continue }
+        try { $fs = New-Object IO.FileStream($f.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite, 65536) }
+        catch {
+            [void]$failed.Add($f.Rel); Write-Log "READ $($f.Full): $($_.Exception.Message)"
+            continue
+        }
+        try {
+            $w.Write([int]$i); $w.Flush()
+            [void]$fs.Seek($off, [IO.SeekOrigin]::Begin)
+            $left = $f.Size - $off
+            while ($left -gt 0) {
+                $want = [int][Math]::Min([long]$buf.Length, $left)
+                $n = $fs.Read($buf, 0, $want)
+                if ($n -le 0) { throw "Файл стал меньше во время передачи: $($f.Full)" }
+                $Net.Write($buf, 0, $n)
+                $left -= $n; $done += $n; $script:SessionBytes += $n
+                Show-Progress $done $TotalAll $watch $f.Rel
             }
         }
-
-        if ([string]::IsNullOrWhiteSpace($ip)) {
-            continue
-        }
-
-        $name = [string]$peer.HostName
-
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = [string]$peer.DNSName
-        }
-
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = $ip
-        }
-
-        [void]$result.Add([pscustomobject]@{
-            Name = $name.TrimEnd(".")
-            Ip = $ip
-        })
+        finally { $fs.Close() }
     }
-
-    return @($result)
+    $w.Write([int]-1); $w.Flush()
+    Show-Progress $done $TotalAll $watch '' -Force
+    Write-Host ''
+    [void]$r.ReadBoolean()
+    return @{ Problems = $failed }
 }
 
-function Test-TcpPort {
-    param(
-        [string]$Ip,
-        [int]$RemotePort,
-        [int]$TimeoutMs = 900
-    )
+function Test-SafeRel([string]$Rel) {
+    if ([string]::IsNullOrWhiteSpace($Rel)) { return $false }
+    if ([IO.Path]::IsPathRooted($Rel) -or $Rel.Contains(':')) { return $false }
+    foreach ($part in $Rel.Split('\')) { if ($part -eq '..' -or $part -eq '.' -or $part -eq '') { return $false } }
+    if ($Rel.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0) { return $false }
+    return $true
+}
 
-    $client = New-Object Net.Sockets.TcpClient
+function Invoke-ReceiveSession([IO.Stream]$Net, [string]$DestRoot) {
+    $w = New-Object IO.BinaryWriter($Net, [Text.Encoding]::UTF8)
+    $r = New-Object IO.BinaryReader($Net, [Text.Encoding]::UTF8)
 
-    try {
-        $async = $client.BeginConnect($Ip, $RemotePort, $null, $null)
-
-        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs)) {
-            return $false
-        }
-
-        $client.EndConnect($async)
-        return $client.Connected
+    $dirCount = $r.ReadInt32()
+    $dirs = New-Object Collections.ArrayList
+    for ($i = 0; $i -lt $dirCount; $i++) { [void]$dirs.Add($r.ReadString().Replace('/', '\')) }
+    $count = $r.ReadInt32()
+    $files = New-Object 'object[]' $count
+    $total = [long]0
+    for ($i = 0; $i -lt $count; $i++) {
+        $rel = $r.ReadString().Replace('/', '\'); $size = $r.ReadInt64(); $time = $r.ReadInt64()
+        $files[$i] = @{ Rel = $rel; Size = $size; Time = $time }
+        $total += $size
     }
-    catch {
+
+    $bad = $null
+    foreach ($d in $dirs) { if (-not (Test-SafeRel $d)) { $bad = $d; break } }
+    if (-not $bad) { foreach ($f in $files) { if (-not (Test-SafeRel $f.Rel)) { $bad = $f.Rel; break } } }
+    if ($bad) {
+        $w.Write($false); $w.Write("Недопустимый путь: $bad"); $w.Flush()
+        throw (New-FatalError "Отправитель прислал недопустимый путь: $bad")
+    }
+
+    foreach ($d in $dirs) { [void][IO.Directory]::CreateDirectory((Join-Path $DestRoot $d)) }
+
+    $offsets = New-Object 'long[]' $count
+    $need = [long]0
+    for ($i = 0; $i -lt $count; $i++) {
+        $f = $files[$i]
+        $final = Join-Path $DestRoot $f.Rel
+        $part = $final + '.dftpart'
+        $f.Final = $final; $f.Part = $part
+        $off = [long]0
+        if ([IO.File]::Exists($final) -and (New-Object IO.FileInfo($final)).Length -eq $f.Size) { $off = $f.Size }
+        elseif ($f.Size -eq 0) {
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($final))
+            [IO.File]::WriteAllBytes($final, (New-Object byte[] 0))
+            try { [IO.File]::SetLastWriteTimeUtc($final, (New-Object DateTime($f.Time, [DateTimeKind]::Utc))) } catch {}
+        }
+        elseif ([IO.File]::Exists($part)) {
+            $pl = (New-Object IO.FileInfo($part)).Length
+            if ($pl -le $f.Size) { $off = $pl }
+        }
+        $offsets[$i] = $off
+        $need += ($f.Size - $off)
+    }
+
+    $root = [IO.Path]::GetPathRoot($DestRoot)
+    $free = (New-Object IO.DriveInfo($root)).AvailableFreeSpace
+    $have = $total - $need
+    if ($free -lt ($need + 50MB)) {
+        $m = "Мало места на диске $root у получателя: нужно ещё $(Format-Size $need), свободно $(Format-Size $free)."
+        $w.Write($false); $w.Write($m); $w.Flush()
+        throw (New-FatalError $m)
+    }
+    $w.Write($true); $w.Write("У получателя свободно $(Format-Size $free), нужно $(Format-Size $need).")
+    foreach ($o in $offsets) { $w.Write([long]$o) }
+    $w.Flush()
+
+    Write-Info ("Входящие: {0} файлов, {1}. Уже есть: {2}." -f $count, (Format-Size $total), (Format-Size $have))
+    $buf = New-Object byte[] $BufferSize
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $script:SessionBytes = 0
+    $done = $have
+    while ($true) {
+        $idx = $r.ReadInt32()
+        if ($idx -eq -1) { break }
+        if ($idx -lt 0 -or $idx -ge $count -or $offsets[$idx] -ge $files[$idx].Size) { throw "Неверный номер файла $idx" }
+        $f = $files[$idx]
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($f.Part))
+        $fs = New-Object IO.FileStream($f.Part, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::None, 65536)
+        try {
+            $fs.SetLength($offsets[$idx])
+            [void]$fs.Seek($offsets[$idx], [IO.SeekOrigin]::Begin)
+            $left = $f.Size - $offsets[$idx]
+            while ($left -gt 0) {
+                $want = [int][Math]::Min([long]$buf.Length, $left)
+                $n = $Net.Read($buf, 0, $want)
+                if ($n -le 0) { throw 'Соединение закрыто другой стороной.' }
+                $fs.Write($buf, 0, $n)
+                $left -= $n; $done += $n; $script:SessionBytes += $n
+                Show-Progress $done $total $watch $f.Rel
+            }
+        }
+        finally { $fs.Close() }
+        if ([IO.File]::Exists($f.Final)) {
+            [IO.File]::SetAttributes($f.Final, [IO.FileAttributes]::Normal)
+            [IO.File]::Delete($f.Final)
+        }
+        [IO.File]::Move($f.Part, $f.Final)
+        try { [IO.File]::SetLastWriteTimeUtc($f.Final, (New-Object DateTime($f.Time, [DateTimeKind]::Utc))) } catch {}
+        $offsets[$idx] = $f.Size
+    }
+    Show-Progress $done $total $watch '' -Force
+    Write-Host ''
+    $w.Write($true); $w.Flush()
+
+    $missing = New-Object Collections.ArrayList
+    for ($i = 0; $i -lt $count; $i++) { if ($offsets[$i] -lt $files[$i].Size) { [void]$missing.Add($files[$i].Rel) } }
+    return @{ Problems = $missing }
+}
+
+# ---------------------------------------------------------------- сеть
+
+function Parse-Code([string]$Text) {
+    if (-not $Text) { return $null }
+    $t = $Text.Trim().Trim('"', "'", ' ')
+    if ($t -notmatch '^(?<hosts>.+):(?<port>\d{1,5}):(?<pin>\d{4,10})$') { return $null }
+    $hosts = @()
+    foreach ($h in $Matches['hosts'].Split(',')) { $h = $h.Trim().Trim('[', ']'); if ($h) { $hosts += $h } }
+    return @{ Hosts = $hosts; Port = [int]$Matches['port']; Pin = $Matches['pin'] }
+}
+
+function Connect-Peer($CodeInfo) {
+    foreach ($h in $CodeInfo.Hosts) {
+        $addrs = @()
+        $a = $null
+        if ([Net.IPAddress]::TryParse($h, [ref]$a)) { $addrs = @($a) }
+        else { try { $addrs = [Net.Dns]::GetHostAddresses($h) } catch { continue } }
+        foreach ($ip in $addrs) {
+            $c = New-Object Net.Sockets.TcpClient($ip.AddressFamily)
+            try {
+                $ar = $c.BeginConnect($ip, $CodeInfo.Port, $null, $null)
+                if ($ar.AsyncWaitHandle.WaitOne(7000)) {
+                    $c.EndConnect($ar)
+                    if ($c.Connected) { return $c }
+                }
+            }
+            catch {}
+            $c.Close()
+        }
+    }
+    return $null
+}
+
+function Initialize-Client([Net.Sockets.TcpClient]$Client) {
+    $Client.NoDelay = $true
+    $Client.ReceiveTimeout = 120000
+    $Client.SendTimeout = 120000
+    $Client.SendBufferSize = 1MB
+    $Client.ReceiveBufferSize = 1MB
+    $Client.Client.SetSocketOption([Net.Sockets.SocketOptionLevel]::Socket, [Net.Sockets.SocketOptionName]::KeepAlive, $true)
+}
+
+# Рукопожатие: подключающийся сообщает PIN и свою роль, ожидающий проверяет.
+function Send-Hello([IO.Stream]$Net, [string]$PinCode, [string]$Role) {
+    $w = New-Object IO.BinaryWriter($Net, [Text.Encoding]::UTF8)
+    $r = New-Object IO.BinaryReader($Net, [Text.Encoding]::UTF8)
+    $w.Write($Magic); $w.Write($PinCode); $w.Write($Role); $w.Flush()
+    $ok = $r.ReadBoolean(); $msg = $r.ReadString()
+    if (-not $ok) { throw (New-FatalError $msg) }
+}
+
+function Receive-Hello([IO.Stream]$Net, [string]$PinCode, [string]$MyRole) {
+    $w = New-Object IO.BinaryWriter($Net, [Text.Encoding]::UTF8)
+    $r = New-Object IO.BinaryReader($Net, [Text.Encoding]::UTF8)
+    if ($r.ReadString() -ne $Magic) { return $false }
+    $p = $r.ReadString(); $role = $r.ReadString()
+    if ($p -ne $PinCode) {
+        Start-Sleep -Seconds 2
+        $w.Write($false); $w.Write('Неверный PIN в коде подключения.'); $w.Flush()
+        Write-Warn 'Кто-то подключился с неверным PIN - отклонено.'
         return $false
     }
-    finally {
-        $client.Close()
+    if ($role -eq $MyRole) {
+        $m = 'Обе стороны выбрали одно и то же. Один должен ОТПРАВЛЯТЬ, другой ПОЛУЧАТЬ.'
+        $w.Write($false); $w.Write($m); $w.Flush(); Write-Warn $m
+        return $false
     }
+    $w.Write($true); $w.Write(''); $w.Flush()
+    return $true
 }
 
-function Find-Receiver {
-    param(
-        [string]$Exe,
-        [int]$ReceiverPort
-    )
-
-    Write-Host ""
-    Write-Info "Ищу компьютер, на котором запущен режим ПОЛУЧАТЕЛЬ..."
-
-    for ($attempt = 1; $attempt -le 12; $attempt++) {
-        $peers = @(Get-TailscalePeers $Exe)
-        $found = New-Object System.Collections.ArrayList
-
-        foreach ($peer in $peers) {
-            Write-Host ("  Проверяю {0} ({1})..." -f $peer.Name, $peer.Ip) -ForegroundColor DarkGray
-
-            if (Test-TcpPort -Ip $peer.Ip -RemotePort $ReceiverPort) {
-                [void]$found.Add($peer)
-            }
-        }
-
-        if ($found.Count -eq 1) {
-            Write-Ok "Получатель найден автоматически: $($found[0].Name) ($($found[0].Ip))"
-            return $found[0]
-        }
-
-        if ($found.Count -gt 1) {
-            Write-Host ""
-            Write-Warn "Найдено несколько компьютеров-получателей:"
-
-            for ($i = 0; $i -lt $found.Count; $i++) {
-                Write-Host ("{0} - {1} ({2})" -f ($i + 1), $found[$i].Name, $found[$i].Ip)
-            }
-
-            $choiceText = Read-Host "Выберите номер"
-            $choice = 0
-
-            if (-not [int]::TryParse($choiceText, [ref]$choice)) {
-                throw "Неверный номер."
-            }
-
-            if ($choice -lt 1 -or $choice -gt $found.Count) {
-                throw "Неверный номер."
-            }
-
-            return $found[$choice - 1]
-        }
-
-        if ($attempt -lt 12) {
-            Write-Warn "Получатель пока не найден. Попытка $attempt/12. Жду 2 секунды..."
-            Start-Sleep -Seconds 2
-        }
-    }
-
-    throw "Получатель не найден. На Windows 11 сначала запустите этот же скрипт, выберите 2 - ПОЛУЧАТЕЛЬ и оставьте окно открытым."
+function Show-Code([string]$Text) {
+    Write-Host ''
+    Write-Host '  ================ КОД ПОДКЛЮЧЕНИЯ ================' -ForegroundColor Green
+    Write-Host ''
+    Write-Host "     $Text     " -ForegroundColor White -BackgroundColor DarkGreen
+    Write-Host ''
+    Write-Host '  ==================================================' -ForegroundColor Green
+    try { Set-Clipboard -Value $Text; Write-Host '  Код уже скопирован - вставьте его в мессенджер и отправьте второй стороне.' -ForegroundColor Gray }
+    catch { Write-Host '  Выделите код мышью, нажмите Enter (копировать) и отправьте второй стороне.' -ForegroundColor Gray }
+    Write-Host ''
 }
 
-function Show-Route {
-    param(
-        [string]$Exe,
-        [string]$Target
-    )
-
-    Write-Info "Проверяю маршрут Tailscale..."
-
-    try {
-        $lines = @(& $Exe ping --c 3 $Target 2>&1)
-        $lines | ForEach-Object { Write-Host "  $_" }
-
-        $direct = $false
-
-        foreach ($line in $lines) {
-            $text = [string]$line
-
-            if ($text -match '\svia\s' -and $text -notmatch 'DERP' -and $text -notmatch 'peer-relay') {
-                $direct = $true
-            }
-        }
-
-        if ($direct) {
-            Write-Ok "Подтвержден прямой P2P-маршрут."
-        }
-        else {
-            Write-Warn "Прямой маршрут не подтвержден. Tailscale может использовать зашифрованный relay."
-        }
-    }
-    catch {
-        Write-Warn "Проверка маршрута не удалась, продолжаю подключение."
-    }
-}
-
-function Receive-Session {
-    param(
-        [Net.Sockets.TcpClient]$Client,
-        [string]$Root
-    )
-
-    $stream = $Client.GetStream()
-    $stream.ReadTimeout = 300000
-    $stream.WriteTimeout = 300000
-
-    $hello = Receive-Json $stream
-
-    if ($hello.type -ne "hello" -or [int]$hello.protocol -ne $ProtocolVersion) {
-        Send-Json $stream @{
-            type = "error"
-            message = "Несовместимая версия скрипта. Обновите скрипт на обоих компьютерах."
-        }
-
-        throw "Несовместимая версия протокола."
-    }
-
-    Send-Json $stream @{
-        type = "hello-ok"
-        computer = $env:COMPUTERNAME
-    }
-
-    Write-Ok "Подключен отправитель: $($hello.computer)"
-
-    $summary = Receive-Json $stream
-
-    if ($summary.type -ne "summary") {
-        throw "Не получена информация об объеме передачи."
-    }
-
-    $totalBytes = [int64]$summary.totalBytes
-    $totalFiles = [int]$summary.totalFiles
-    $free = Get-FreeBytes $Root
-
-    Write-Info "Будет принято: $totalFiles файлов, $(Format-Size $totalBytes)."
-    Write-Info "Свободно: $(Format-Size $free)."
-
-    Send-Json $stream @{
-        type = "summary-ok"
-        freeBytes = $free
-    }
-
-    $receivedFiles = 0
-    $receivedBytes = [int64]0
-
-    while ($true) {
-        $msg = Receive-Json $stream
-
-        if ($msg.type -eq "done") {
-            Send-Json $stream @{
-                type = "done-ok"
-                files = $receivedFiles
-                bytes = $receivedBytes
-            }
-
-            Write-Ok "Передача завершена: $receivedFiles файлов, $(Format-Size $receivedBytes)."
-            return
-        }
-
-        if ($msg.type -eq "directory") {
-            $dir = Get-SafePath -Root $Root -Relative ([string]$msg.path)
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-
-            Send-Json $stream @{
-                type = "directory-ok"
-            }
-
-            continue
-        }
-
-        if ($msg.type -ne "file") {
-            throw "Неизвестная команда: $($msg.type)"
-        }
-
-        $dest = Get-SafePath -Root $Root -Relative ([string]$msg.path)
-        $parent = Split-Path -Parent $dest
-
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
-
-        $length = [int64]$msg.length
-        $ticks = [int64]$msg.ticks
-
-        if (Test-Path -LiteralPath $dest -PathType Leaf) {
-            $existing = Get-Item -LiteralPath $dest -Force
-
-            if ([int64]$existing.Length -eq $length -and [int64]$existing.LastWriteTimeUtc.Ticks -eq $ticks) {
-                Send-Json $stream @{
-                    type = "ready"
-                    offset = $length
-                    skip = $true
-                }
-
-                $endMessage = Receive-Json $stream
-
-                if ($endMessage.type -ne "file-end") {
-                    throw "Ошибка протокола после пропущенного файла."
-                }
-
-                Send-Json $stream @{
-                    type = "file-ok"
-                    skipped = $true
-                }
-
-                $receivedFiles++
-                $receivedBytes += $length
-                continue
-            }
-        }
-
-        $part = $dest + ".pctransfer.part"
-        $offset = [int64]0
-
-        if (Test-Path -LiteralPath $part -PathType Leaf) {
-            $offset = [int64](Get-Item -LiteralPath $part -Force).Length
-
-            if ($offset -gt $length) {
-                Remove-Item -LiteralPath $part -Force
-                $offset = 0
-            }
-        }
-
-        $remaining = $length - $offset
-        $freeNow = Get-FreeBytes $Root
-
-        if ($freeNow -lt $remaining) {
-            Send-Json $stream @{
-                type = "error"
-                message = "Недостаточно свободного места для $($msg.path). Нужно $(Format-Size $remaining), доступно $(Format-Size $freeNow)."
-            }
-
-            throw "Недостаточно свободного места."
-        }
-
-        Send-Json $stream @{
-            type = "ready"
-            offset = $offset
-            skip = $false
-        }
-
-        $fileStream = New-Object IO.FileStream(
-            $part,
-            [IO.FileMode]::OpenOrCreate,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::None,
-            $BufferSize,
-            [IO.FileOptions]::SequentialScan
-        )
-
+# Соединение + сессия с повторами: после обрыва новая сессия продолжает с того же места.
+function Invoke-Transfer([string]$Role, [bool]$IsListener, $CodeInfo, [scriptblock]$Work) {
+    if ($IsListener) {
+        $pinCode = $Pin
+        if (-not $pinCode) { $pinCode = '{0:D6}' -f (Get-Random -Minimum 100000 -Maximum 1000000) }
+        $listener = $null
         try {
-            $fileStream.Position = $offset
-            $buffer = New-Object byte[] $BufferSize
-            $done = [int64]0
-
-            while ($done -lt $remaining) {
-                $need = [int][Math]::Min([int64]$buffer.Length, $remaining - $done)
-                $n = $stream.Read($buffer, 0, $need)
-
-                if ($n -le 0) {
-                    throw "Соединение оборвалось при получении $($msg.path)."
-                }
-
-                $fileStream.Write($buffer, 0, $n)
-                $done += $n
-            }
-
-            $fileStream.Flush()
-        }
-        finally {
-            $fileStream.Dispose()
-        }
-
-        $fileEnd = Receive-Json $stream
-
-        if ($fileEnd.type -ne "file-end") {
-            throw "Ошибка протокола после файла."
-        }
-
-        $actual = [int64](Get-Item -LiteralPath $part -Force).Length
-
-        if ($actual -ne $length) {
-            throw "Размер принятого файла не совпал: $($msg.path)."
-        }
-
-        if (Test-Path -LiteralPath $dest) {
-            Remove-Item -LiteralPath $dest -Force
-        }
-
-        Move-Item -LiteralPath $part -Destination $dest -Force
-        [IO.File]::SetLastWriteTimeUtc(
-            $dest,
-            (New-Object DateTime($ticks, [DateTimeKind]::Utc))
-        )
-
-        Send-Json $stream @{
-            type = "file-ok"
-            skipped = $false
-        }
-
-        $receivedFiles++
-        $receivedBytes += $length
-
-        Write-Ok "Получен: $($msg.path)"
-    }
-}
-
-function Run-Receiver([string]$Exe) {
-    if (-not (Is-Admin)) {
-        Restart-ReceiverAsAdmin
-    }
-
-    $ip = Get-TailscaleIPv4 $Exe
-    $defaultPath = "C:\Users\owner\Downloads\Torrents"
-
-    if ([string]::IsNullOrWhiteSpace($Destination)) {
-        Write-Host ""
-        $entered = Read-Host "Папка для загрузки [Enter = $defaultPath]"
-
-        if ([string]::IsNullOrWhiteSpace($entered)) {
-            $script:Destination = $defaultPath
-        }
-        else {
-            $script:Destination = Normalize-DraggedPath $entered
-        }
-    }
-
-    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    $root = [IO.Path]::GetFullPath($Destination)
-
-    Add-TemporaryFirewallRule -Ip $ip -ListenPort $Port
-
-    $listener = New-Object Net.Sockets.TcpListener(
-        [Net.IPAddress]::Parse($ip),
-        $Port
-    )
-
-    $listener.Start()
-
-    try {
-        Clear-Host
-
-        Write-Host "============================================================" -ForegroundColor DarkCyan
-        Write-Host "              ПОЛУЧАТЕЛЬ ГОТОВ" -ForegroundColor Green
-        Write-Host "============================================================" -ForegroundColor DarkCyan
-        Write-Host ""
-        Write-Host "Папка назначения:"
-        Write-Host "  $root" -ForegroundColor White
-        Write-Host ""
-        Write-Host "Ничего копировать и отправлять НЕ НУЖНО." -ForegroundColor Yellow
-        Write-Host "На другом компьютере выберите 1 - ОТПРАВИТЕЛЬ."
-        Write-Host "Он найдет этот компьютер автоматически."
-        Write-Host ""
-        Write-Host "Не закрывайте это окно."
-        Write-Host "============================================================"
-        Write-Host ""
-
-        while ($true) {
-            Write-Info "ОЖИДАЮ ОТПРАВИТЕЛЯ..."
-
-            $client = $listener.AcceptTcpClient()
-
             try {
-                Write-Info "Подключение от $($client.Client.RemoteEndPoint)"
-                Receive-Session -Client $client -Root $root
-                break
+                $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::IPv6Any, $Port)
+                $listener.Server.DualMode = $true
+                $listener.Start()
             }
             catch {
-                $message = $_.Exception.Message
-                Write-Warn $message
-                Log $_.Exception.ToString()
+                $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Any, $Port)
+                $listener.Start()
+            }
+            Open-FirewallPort $Port
 
+            $hosts = @()
+            if ($Local) { $hosts = @('127.0.0.1') }
+            else {
+                Write-Info 'Открываю порт на роутере и определяю внешний адрес...'
+                $gw = Open-UpnpPort $Port
+                $v4 = Get-PublicIPv4
+                $v6 = Get-PublicIPv6
+                if ($v4) { $hosts += $v4 }
+                if ($v6) { $hosts += "[$v6]" }
+                if (-not $hosts) { throw (New-FatalError 'Нет интернета: не удалось определить внешний IP.') }
+                if ($gw -and $gw.External -and $v4 -and ($gw.External -ne $v4 -or (Test-PrivateIPv4 $gw.External))) {
+                    Write-Warn "Провайдер дал роутеру серый адрес ($($gw.External)), поэтому по IPv4 к этому ПК снаружи, скорее всего, не подключиться."
+                    if ($v6) { Write-Info 'Но есть IPv6 - он тоже в коде, отправитель попробует его.' }
+                    else { Write-Warn 'Если отправитель не подключится - поменяйтесь: здесь пункт 4, у отправителя пункт 3.' }
+                }
+            }
+            Show-Code (($hosts -join ',') + (':{0}:{1}' -f $Port, $pinCode))
+            Write-Info 'Жду подключения второй стороны... (Ctrl+C - отмена)'
+
+            while ($true) {
+                if (-not $listener.Pending()) { Start-Sleep -Milliseconds 200; continue }
+                $client = $listener.AcceptTcpClient()
                 try {
-                    if ($client -and $client.Connected) {
-                        Send-Json $client.GetStream() @{
-                            type = "error"
-                            message = "Ошибка на принимающем ПК: $message"
-                        }
-                    }
+                    Initialize-Client $client
+                    $client.ReceiveTimeout = 15000
+                    $net = $client.GetStream()
+                    if (-not (Receive-Hello $net $pinCode $Role)) { continue }
+                    $client.ReceiveTimeout = 120000
+                    Write-Ok "Подключено: $($client.Client.RemoteEndPoint)"
+                    return (& $Work $net)
                 }
-                catch {}
+                catch [ApplicationException] { Write-Host ''; Write-Fail $_.Exception.Message; return $null }
+                catch {
+                    Write-Host ''
+                    Write-Warn "Связь прервалась: $($_.Exception.Message)"
+                    Write-Log "NET $($_.Exception.Message)"
+                    Write-Info 'Жду повторного подключения - передача продолжится с того же места...'
+                }
+                finally { $client.Close() }
             }
-            finally {
-                $client.Close()
+        }
+        catch [ApplicationException] { Write-Fail $_.Exception.Message; return $null }
+        finally {
+            if ($listener) { $listener.Stop() }
+            Close-UpnpPort $Port
+            Close-FirewallPort
+        }
+    }
+    else {
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            Write-Info "Подключаюсь к $($CodeInfo.Hosts -join ' / ') ..."
+            $client = Connect-Peer $CodeInfo
+            if (-not $client) {
+                if ($attempt -ge 3) {
+                    Write-Warn 'Не подключается. Проверьте, что вторая сторона ждёт подключения и код верный.'
+                    Write-Warn 'Если так и не подключится - поменяйтесь: у отправителя пункт 3, у получателя пункт 4.'
+                }
+                Write-Info 'Повтор через 5 секунд... (Ctrl+C - отмена)'
+                Start-Sleep -Seconds 5
+                continue
             }
-        }
-    }
-    finally {
-        $listener.Stop()
-        Remove-TemporaryFirewallRule
-    }
-}
-
-function Read-Sources {
-    $list = New-Object System.Collections.ArrayList
-
-    Write-Host ""
-    Write-Host "Перетащите папку/файл в это окно или вставьте путь."
-    Write-Host "Можно добавить несколько папок."
-    Write-Host "Пустой Enter - закончить выбор."
-    Write-Host ""
-
-    while ($true) {
-        $raw = Read-Host "Путь"
-
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            break
-        }
-
-        $path = Normalize-DraggedPath $raw
-
-        if (-not (Test-Path -LiteralPath $path)) {
-            Write-Warn "Не найдено: $path"
-            continue
-        }
-
-        [void]$list.Add($path)
-        Write-Ok "Добавлено: $path"
-    }
-
-    return @($list)
-}
-
-function Send-Entries {
-    param(
-        [IO.Stream]$Stream,
-        $Entries
-    )
-
-    $files = @($Entries | Where-Object { $_.Kind -eq "File" })
-    $totalFiles = $files.Count
-    $totalBytes = [int64]0
-
-    foreach ($file in $files) {
-        $totalBytes += [int64]$file.Length
-    }
-
-    Send-Json $Stream @{
-        type = "summary"
-        totalFiles = $totalFiles
-        totalBytes = $totalBytes
-    }
-
-    $summaryAck = Receive-Json $Stream
-
-    if ($summaryAck.type -eq "error") {
-        throw [string]$summaryAck.message
-    }
-
-    if ($summaryAck.type -ne "summary-ok") {
-        throw "Получатель не подтвердил начало передачи."
-    }
-
-    Write-Info "Файлов: $totalFiles"
-    Write-Info "Общий размер: $(Format-Size $totalBytes)"
-
-    $completedFiles = 0
-    $completedBytes = [int64]0
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-
-    foreach ($entry in $Entries) {
-        if ($entry.Kind -eq "Directory") {
-            Send-Json $Stream @{
-                type = "directory"
-                path = $entry.Relative
-            }
-
-            $ack = Receive-Json $Stream
-
-            if ($ack.type -eq "error") {
-                throw [string]$ack.message
-            }
-
-            if ($ack.type -ne "directory-ok") {
-                throw "Получатель не подтвердил создание папки."
-            }
-
-            continue
-        }
-
-        Write-Host ""
-        Write-Info ("{0}/{1}: {2} ({3})" -f ($completedFiles + 1), $totalFiles, $entry.Relative, (Format-Size $entry.Length))
-
-        Send-Json $Stream @{
-            type = "file"
-            path = $entry.Relative
-            length = [int64]$entry.Length
-            ticks = [int64]$entry.Ticks
-        }
-
-        $ready = Receive-Json $Stream
-
-        if ($ready.type -eq "error") {
-            throw [string]$ready.message
-        }
-
-        if ($ready.type -ne "ready") {
-            throw "Получатель не готов принять файл."
-        }
-
-        $offset = [int64]$ready.offset
-
-        if ($offset -lt 0 -or $offset -gt [int64]$entry.Length) {
-            throw "Получено некорректное смещение продолжения."
-        }
-
-        if ($offset -lt [int64]$entry.Length) {
-            if ($offset -gt 0) {
-                Write-Info "Продолжаю файл с $(Format-Size $offset)."
-            }
-
-            $fileStream = New-Object IO.FileStream(
-                $entry.Local,
-                [IO.FileMode]::Open,
-                [IO.FileAccess]::Read,
-                [IO.FileShare]::Read,
-                $BufferSize,
-                [IO.FileOptions]::SequentialScan
-            )
-
             try {
-                $fileStream.Position = $offset
-                $buffer = New-Object byte[] $BufferSize
-                $sent = $offset
-                $lastUpdate = [DateTime]::MinValue
-
-                while ($sent -lt [int64]$entry.Length) {
-                    $need = [int][Math]::Min(
-                        [int64]$buffer.Length,
-                        [int64]$entry.Length - $sent
-                    )
-
-                    $n = $fileStream.Read($buffer, 0, $need)
-
-                    if ($n -le 0) {
-                        throw "Исходный файл неожиданно закончился."
-                    }
-
-                    $Stream.Write($buffer, 0, $n)
-                    $sent += $n
-
-                    if (((Get-Date) - $lastUpdate).TotalMilliseconds -ge 400 -or $sent -eq [int64]$entry.Length) {
-                        if ($entry.Length -gt 0) {
-                            $percent = [int](100.0 * $sent / $entry.Length)
-                        }
-                        else {
-                            $percent = 100
-                        }
-
-                        $elapsed = [Math]::Max($watch.Elapsed.TotalSeconds, 0.1)
-                        $speed = ($completedBytes + $sent) / $elapsed
-
-                        $status = "$(Format-Size $sent) / $(Format-Size $entry.Length) | $(Format-Size ([int64]$speed))/s"
-
-                        Write-Progress -Activity $entry.Relative -Status $status -PercentComplete $percent
-                        $lastUpdate = Get-Date
-                    }
-                }
-
-                $Stream.Flush()
+                Initialize-Client $client
+                $net = $client.GetStream()
+                Send-Hello $net $CodeInfo.Pin $Role
+                Write-Ok "Подключено к $($client.Client.RemoteEndPoint)"
+                $attempt = 0
+                return (& $Work $net)
             }
-            finally {
-                $fileStream.Dispose()
-                Write-Progress -Activity $entry.Relative -Completed
+            catch [ApplicationException] { Write-Host ''; Write-Fail $_.Exception.Message; return $null }
+            catch {
+                Write-Host ''
+                Write-Warn "Связь прервалась: $($_.Exception.Message)"
+                Write-Log "NET $($_.Exception.Message)"
+                Write-Info 'Переподключаюсь через 5 секунд - передача продолжится с того же места...'
+                Start-Sleep -Seconds 5
             }
+            finally { $client.Close() }
         }
-        else {
-            Write-Info "Файл уже есть у получателя - пропуск."
-        }
-
-        Send-Json $Stream @{
-            type = "file-end"
-        }
-
-        $ack = Receive-Json $Stream
-
-        if ($ack.type -eq "error") {
-            throw [string]$ack.message
-        }
-
-        if ($ack.type -ne "file-ok") {
-            throw "Получатель не подтвердил файл."
-        }
-
-        $completedFiles++
-        $completedBytes += [int64]$entry.Length
-
-        $elapsed = [Math]::Max($watch.Elapsed.TotalSeconds, 0.1)
-        $speed = $completedBytes / $elapsed
-        $remaining = [Math]::Max([int64]0, $totalBytes - $completedBytes)
-
-        if ($speed -gt 0) {
-            $etaSeconds = [int]($remaining / $speed)
-        }
-        else {
-            $etaSeconds = 0
-        }
-
-        $eta = [TimeSpan]::FromSeconds($etaSeconds)
-
-        Write-Ok "Общий прогресс: $completedFiles/$totalFiles | $(Format-Size $completedBytes)/$(Format-Size $totalBytes) | $(Format-Size ([int64]$speed))/s | осталось ~$($eta.ToString('hh\:mm\:ss'))"
-    }
-
-    Send-Json $Stream @{
-        type = "done"
-    }
-
-    $done = Receive-Json $Stream
-
-    if ($done.type -eq "error") {
-        throw [string]$done.message
-    }
-
-    if ($done.type -ne "done-ok") {
-        throw "Получатель не подтвердил завершение."
-    }
-
-    $watch.Stop()
-}
-
-function Run-Sender([string]$Exe) {
-    [void](Get-TailscaleIPv4 $Exe)
-
-    if (-not $Source -or $Source.Count -eq 0) {
-        $script:Source = Read-Sources
-    }
-
-    if (-not $Source -or $Source.Count -eq 0) {
-        throw "Не выбрана ни одна папка или файл."
-    }
-
-    Write-Info "Сканирую все папки и подпапки..."
-    $entries = Get-Entries -Paths $Source
-
-    if ($entries.Count -eq 0) {
-        throw "Нет данных для передачи."
-    }
-
-    $fileEntries = @($entries | Where-Object { $_.Kind -eq "File" })
-    $totalBytes = [int64]0
-
-    foreach ($file in $fileEntries) {
-        $totalBytes += [int64]$file.Length
-    }
-
-    Write-Host ""
-    Write-Host "Найдено:"
-    Write-Host "  Файлов: $($fileEntries.Count)"
-    Write-Host "  Размер:  $(Format-Size $totalBytes)"
-    Write-Host ""
-
-    $answer = Read-Host "Начать передачу? [Y/n]"
-
-    if ($answer -and $answer -notmatch '^(y|yes|д|да)$') {
-        Write-Warn "Передача отменена."
-        return
-    }
-
-    $receiver = Find-Receiver -Exe $Exe -ReceiverPort $Port
-
-    Show-Route -Exe $Exe -Target $receiver.Ip
-
-    $client = New-Object Net.Sockets.TcpClient
-
-    try {
-        Write-Info "Подключаюсь к $($receiver.Name) ($($receiver.Ip))..."
-
-        $async = $client.BeginConnect($receiver.Ip, $Port, $null, $null)
-
-        if (-not $async.AsyncWaitHandle.WaitOne(15000)) {
-            throw "Таймаут подключения к получателю."
-        }
-
-        $client.EndConnect($async)
-
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = 300000
-        $stream.WriteTimeout = 300000
-
-        Send-Json $stream @{
-            type = "hello"
-            protocol = $ProtocolVersion
-            computer = $env:COMPUTERNAME
-        }
-
-        $hello = Receive-Json $stream
-
-        if ($hello.type -eq "error") {
-            throw [string]$hello.message
-        }
-
-        if ($hello.type -ne "hello-ok") {
-            throw "Получатель вернул неизвестный ответ."
-        }
-
-        Write-Ok "Соединение установлено с $($hello.computer)."
-
-        Send-Entries -Stream $stream -Entries $entries
-
-        Write-Host ""
-        Write-Ok "ВСЕ ФАЙЛЫ УСПЕШНО ПЕРЕДАНЫ."
-    }
-    finally {
-        $client.Close()
     }
 }
 
-function Menu {
-    Clear-Host
-
-    Write-Host "============================================================" -ForegroundColor DarkCyan
-    Write-Host "     ПРЯМАЯ ПЕРЕДАЧА ПАПОК - WINDOWS 10 / 11" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor DarkCyan
-    Write-Host ""
-    Write-Host "1 - ОТПРАВИТЕЛЬ"
-    Write-Host "2 - ПОЛУЧАТЕЛЬ"
-    Write-Host "0 - Выход"
-    Write-Host ""
-
-    switch (Read-Host "Выберите") {
-        "1" { return "Sender" }
-        "2" { return "Receiver" }
-        "0" { return "Exit" }
-        default { throw "Неверный пункт меню." }
+function Read-Code {
+    while ($true) {
+        $t = Read-Host 'Вставьте КОД ПОДКЛЮЧЕНИЯ от второй стороны (правый клик = вставить)'
+        $c = Parse-Code $t
+        if ($c) { return $c }
+        Write-Fail 'Код не похож на правильный. Пример: 85.12.34.56:42873:123456'
     }
 }
 
-try {
-    Init-Log
+# ---------------------------------------------------------------- режимы
 
-    if ($Mode -eq "Menu") {
-        $Mode = Menu
-
-        if ($Mode -eq "Exit") {
-            exit
-        }
+function Start-Send([bool]$IsListener) {
+    $src = $Paths
+    if (-not $src) { $src = Read-SourcePaths }
+    foreach ($p in $src) { if (-not (Test-Path -LiteralPath $p)) { Write-Fail "Не найдено: $p"; return } }
+    Write-Info 'Считаю файлы...'
+    $manifest = Get-Manifest $src
+    $total = [long]0
+    foreach ($f in $manifest.Files) { $total += $f.Size }
+    Write-Host ''
+    Write-Host ("Найдено: {0} пап., {1} файлов, всего {2}" -f $manifest.Dirs.Count, $manifest.Files.Count, (Format-Size $total)) -ForegroundColor White
+    if ($Mode -eq 'Menu') {
+        $a = Read-Host 'Начать? (Enter = да, N = отмена)'
+        if ($a -match '^[nNнН]') { return }
     }
-
-    $tailscale = Ensure-Tailscale
-
-    if ($Mode -eq "Receiver") {
-        Run-Receiver $tailscale
+    $codeInfo = $null
+    if (-not $IsListener) {
+        if ($Code) { $codeInfo = Parse-Code $Code; if (-not $codeInfo) { Write-Fail 'Неверный -Code'; return } }
+        else { $codeInfo = Read-Code }
     }
-    elseif ($Mode -eq "Sender") {
-        Run-Sender $tailscale
+    Write-Log "SEND start: $($src -join ' | ') files=$($manifest.Files.Count) bytes=$total"
+    $res = Invoke-Transfer 'send' $IsListener $codeInfo { param($net) Invoke-SendSession $net $manifest $total }
+    if ($null -eq $res) { return }
+    Write-Host ''
+    if ($res.Problems.Count -gt 0) {
+        Write-Warn "Не удалось прочитать $($res.Problems.Count) файл(ов) (заняты/нет доступа). Лог: $LogFile"
+        $res.Problems | Select-Object -First 20 | ForEach-Object { Write-Host "   $_" -ForegroundColor Yellow }
     }
+    else { Write-Ok 'ГОТОВО. Всё передано.' }
+    Write-Log "SEND done, problems=$($res.Problems.Count)"
 }
-catch {
-    Write-Host ""
-    Write-Host "[ОШИБКА] $($_.Exception.Message)" -ForegroundColor Red
 
-    Log $_.Exception.ToString()
-
-    if ($LogFile) {
-        Write-Host "Лог: $LogFile"
+function Start-Receive([bool]$IsListener) {
+    $defaultDest = 'C:\Users\owner\Downloads\Torrents'
+    if (-not (Test-Path -LiteralPath 'C:\Users\owner')) { $defaultDest = Join-Path $env:USERPROFILE 'Downloads\Torrents' }
+    $d = $Dest
+    if (-not $d) {
+        Write-Host ''
+        Write-Host "Куда сохранить? Enter = $defaultDest" -ForegroundColor White
+        $line = Read-Host 'Папка (можно перетащить)'
+        $d = $defaultDest
+        if (-not [string]::IsNullOrWhiteSpace($line)) { $d = (Get-CleanPaths $line)[0] }
     }
-
-    exit 1
+    $d = [IO.Path]::GetFullPath($d)
+    [void][IO.Directory]::CreateDirectory($d)
+    Write-Ok "Сохраняю в: $d"
+    $codeInfo = $null
+    if (-not $IsListener) {
+        if ($Code) { $codeInfo = Parse-Code $Code; if (-not $codeInfo) { Write-Fail 'Неверный -Code'; return } }
+        else { $codeInfo = Read-Code }
+    }
+    Write-Log "RECV start: $d"
+    $res = Invoke-Transfer 'recv' $IsListener $codeInfo { param($net) Invoke-ReceiveSession $net $d }
+    if ($null -eq $res) { return }
+    Write-Host ''
+    if ($res.Problems.Count -gt 0) {
+        Write-Warn "Не получено $($res.Problems.Count) файл(ов) - отправитель не смог их прочитать:"
+        $res.Problems | Select-Object -First 20 | ForEach-Object { Write-Host "   $_" -ForegroundColor Yellow }
+    }
+    else { Write-Ok "ГОТОВО. Всё получено в: $d" }
+    Write-Log "RECV done, problems=$($res.Problems.Count)"
+    if ($Mode -eq 'Menu') { try { Start-Process explorer.exe $d } catch {} }
 }
-finally {
-    Remove-TemporaryFirewallRule
+
+# ---------------------------------------------------------------- запуск
+
+Write-Title "Прямая передача папок ПК -> ПК  v$ScriptVersion"
+
+if ($Mode -eq 'Send') { Start-Send ([bool]$Listen); return }
+if ($Mode -eq 'Receive') { Start-Receive (-not $Code); return }
+
+Write-Host ''
+Write-Host '  1 - ОТПРАВИТЬ папки' -ForegroundColor White
+Write-Host '  2 - ПОЛУЧИТЬ папки' -ForegroundColor White
+Write-Host ''
+Write-Host '  Если 1 и 2 не смогли соединиться (провайдер закрыл входящие):' -ForegroundColor Gray
+Write-Host '  3 - ОТПРАВИТЬ (ждать подключения получателя)' -ForegroundColor Gray
+Write-Host '  4 - ПОЛУЧИТЬ (подключиться к отправителю по его коду)' -ForegroundColor Gray
+Write-Host ''
+$choice = ''
+while ($choice -notmatch '^[1-4]$') { $choice = ([string](Read-Host 'Выберите 1-4')).Trim() }
+switch ($choice) {
+    '1' { Start-Send $false }
+    '2' { Start-Receive $true }
+    '3' { Start-Send $true }
+    '4' { Start-Receive $false }
 }

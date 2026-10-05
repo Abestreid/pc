@@ -375,8 +375,7 @@ function Receive-Session {
     Write-Info "Свободно на диске назначения: $(Format-Size $free)."
 
     if ($free -lt $totalBytes) {
-        Send-Json $stream @{type="error";message="Not enough disk space"}
-        throw "Недостаточно свободного места. Нужно до $(Format-Size $totalBytes), доступно $(Format-Size $free)."
+        Write-Warn "Свободного места меньше полного объема передачи. Уже имеющиеся/частично переданные файлы будут учтены по мере передачи."
     }
 
     Send-Json $stream @{type="summary-ok";freeBytes=$free}
@@ -432,9 +431,14 @@ function Receive-Session {
             }
         }
 
-        Send-Json $stream @{type="ready";offset=$offset;skip=$false}
-
         $remaining = $length - $offset
+        $freeNow = Get-FreeBytes $Root
+        if ($freeNow -lt $remaining) {
+            Send-Json $stream @{type="error";message="Недостаточно свободного места для файла $($msg.path). Нужно $(Format-Size $remaining), доступно $(Format-Size $freeNow)."}
+            throw "Недостаточно свободного места для файла $($msg.path)."
+        }
+
+        Send-Json $stream @{type="ready";offset=$offset;skip=$false}
         $fs = New-Object IO.FileStream($part,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::Write,[IO.FileShare]::None,$BufferSize,[IO.FileOptions]::SequentialScan)
 
         try {
@@ -600,6 +604,7 @@ function Send-Entries {
 
         Send-Json $Stream @{type="file";path=$entry.Relative;length=[int64]$entry.Length;ticks=[int64]$entry.Ticks}
         $ready = Receive-Json $Stream
+        if ($ready.type -eq "error") { throw [string]$ready.message }
         if ($ready.type -ne "ready") { throw "Получатель не готов принять файл." }
 
         $offset = [int64]$ready.offset

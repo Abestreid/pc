@@ -167,10 +167,17 @@ function Get-TailscaleIPv4([string]$Exe) {
 }
 
 function New-Token {
-    $bytes = New-Object byte[] 24
-    $rng = New-Object Security.Cryptography.RNGCryptoServiceProvider
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    return ([Convert]::ToBase64String($bytes)).TrimEnd("=").Replace("+","-").Replace("/","_")
+    # Human-safe token: only hexadecimal characters, no ambiguous punctuation.
+    return ([Guid]::NewGuid().ToString("N").ToUpperInvariant())
+}
+
+function Normalize-ConnectionText([string]$Text) {
+    if ($null -eq $Text) { return $null }
+
+    # Remove invisible Unicode formatting/control/separator characters that can
+    # appear when a code is copied through a messenger/browser.
+    $clean = [regex]::Replace($Text, '[\p{C}\p{Z}\s]', '')
+    return $clean.Trim()
 }
 
 function Format-Size([int64]$Bytes) {
@@ -356,9 +363,11 @@ function Receive-Session {
         throw "Несовместимая версия протокола."
     }
 
-    if ([string]$hello.token -cne $ExpectedToken) {
-        Send-Json $stream @{type="error";message="Invalid token"}
-        throw "Неверный код подключения."
+    $receivedToken = Normalize-ConnectionText ([string]$hello.token)
+    $expectedClean = Normalize-ConnectionText $ExpectedToken
+    if (-not [string]::Equals($receivedToken,$expectedClean,[StringComparison]::OrdinalIgnoreCase)) {
+        Send-Json $stream @{type="error";message="Неверный или устаревший код подключения. Скопируйте текущий код из окна получателя целиком."}
+        throw "Неверный или устаревший код подключения."
     }
 
     Send-Json $stream @{type="hello-ok";computer=$env:COMPUTERNAME}
@@ -524,8 +533,18 @@ function Run-Receiver([string]$Exe) {
                 Receive-Session -Client $client -ExpectedToken $token -Root $root
                 break
             } catch {
-                Write-Warn $_.Exception.Message
+                $receiverError = $_.Exception.Message
+                Write-Warn $receiverError
                 Log $_.Exception.ToString()
+
+                # Best effort: send the actual receiver-side error before closing.
+                try {
+                    if ($client -and $client.Connected) {
+                        $errStream = $client.GetStream()
+                        Send-Json $errStream @{type="error";message=("Ошибка на принимающем ПК: " + $receiverError)}
+                        Start-Sleep -Milliseconds 150
+                    }
+                } catch {}
             } finally {
                 $client.Close()
             }
@@ -562,13 +581,234 @@ function Read-Sources {
 }
 
 function Parse-ConnectionCode([string]$Code) {
-    $parts = $Code.Trim().Split("|")
+    $cleanCode = Normalize-ConnectionText $Code
+    $parts = $cleanCode.Split("|")
     if ($parts.Count -ne 3) { throw "Некорректный код подключения. Нужна строка вида IP|PORT|TOKEN." }
 
     $parsedPort = 0
     if (-not [int]::TryParse($parts[1],[ref]$parsedPort)) { throw "Некорректный порт в коде подключения." }
 
-    return [pscustomobject]@{Ip=$parts[0];Port=$parsedPort;Token=$parts[2]}
+    $ip = $parts[0].Trim()
+    $token = (Normalize-ConnectionText $parts[2]).ToUpperInvariant()
+
+    if ($ip -notmatch '^100\.(?:\d{1,3}\.){2}\d{1,3}
+
+function Send-Entries {
+    param([IO.Stream]$Stream,$Entries)
+
+    $files = @($Entries | Where-Object { $_.Kind -eq "File" })
+    $totalFiles = $files.Count
+    $totalBytes = [int64]0
+    foreach ($f in $files) { $totalBytes += [int64]$f.Length }
+
+    Send-Json $Stream @{type="summary";totalFiles=$totalFiles;totalBytes=$totalBytes}
+    $summaryAck = Receive-Json $Stream
+    if ($summaryAck.type -eq "error") { throw $summaryAck.message }
+    if ($summaryAck.type -ne "summary-ok") { throw "Получатель не подтвердил свободное место." }
+
+    Write-Info "Файлов: $totalFiles"
+    Write-Info "Общий размер: $(Format-Size $totalBytes)"
+
+    $completedFiles = 0
+    $completedBytes = [int64]0
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+
+    foreach ($entry in $Entries) {
+        if ($entry.Kind -eq "Directory") {
+            Send-Json $Stream @{type="directory";path=$entry.Relative}
+            $ack = Receive-Json $Stream
+            if ($ack.type -eq "error") { throw [string]$ack.message }
+            if ($ack.type -ne "directory-ok") { throw "Не удалось создать папку у получателя." }
+            continue
+        }
+
+        Write-Host ""
+        Write-Info ("{0}/{1}: {2} ({3})" -f ($completedFiles + 1),$totalFiles,$entry.Relative,(Format-Size $entry.Length))
+
+        Send-Json $Stream @{type="file";path=$entry.Relative;length=[int64]$entry.Length;ticks=[int64]$entry.Ticks}
+        $ready = Receive-Json $Stream
+        if ($ready.type -eq "error") { throw [string]$ready.message }
+        if ($ready.type -ne "ready") { throw "Получатель не готов принять файл." }
+
+        $offset = [int64]$ready.offset
+        if ($offset -lt 0 -or $offset -gt [int64]$entry.Length) { throw "Получено некорректное смещение для продолжения." }
+
+        if ($offset -lt [int64]$entry.Length) {
+            if ($offset -gt 0) { Write-Info "Продолжение с $(Format-Size $offset)." }
+
+            $fs = New-Object IO.FileStream($entry.Local,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read,$BufferSize,[IO.FileOptions]::SequentialScan)
+
+            try {
+                $fs.Position = $offset
+                $buffer = New-Object byte[] $BufferSize
+                $sent = $offset
+                $lastUpdate = [DateTime]::MinValue
+
+                while ($sent -lt [int64]$entry.Length) {
+                    $need = [int][Math]::Min([int64]$buffer.Length,[int64]$entry.Length - $sent)
+                    $n = $fs.Read($buffer,0,$need)
+                    if ($n -le 0) { throw "Исходный файл неожиданно закончился." }
+
+                    $Stream.Write($buffer,0,$n)
+                    $sent += $n
+
+                    if (((Get-Date) - $lastUpdate).TotalMilliseconds -ge 400 -or $sent -eq [int64]$entry.Length) {
+                        $pct = if ($entry.Length -gt 0) { [int](100.0 * $sent / $entry.Length) } else { 100 }
+                        $elapsed = [Math]::Max($watch.Elapsed.TotalSeconds,0.1)
+                        $speed = ($completedBytes + $sent) / $elapsed
+                        $status = "$(Format-Size $sent) / $(Format-Size $entry.Length) | $(Format-Size ([int64]$speed))/s"
+                        Write-Progress -Activity $entry.Relative -Status $status -PercentComplete $pct
+                        $lastUpdate = Get-Date
+                    }
+                }
+
+                $Stream.Flush()
+            } finally {
+                $fs.Dispose()
+                Write-Progress -Activity $entry.Relative -Completed
+            }
+        } else {
+            Write-Info "Уже передан - пропуск."
+        }
+
+        Send-Json $Stream @{type="file-end"}
+        $ack = Receive-Json $Stream
+        if ($ack.type -eq "error") { throw [string]$ack.message }
+        if ($ack.type -ne "file-ok") { throw "Получатель не подтвердил файл." }
+
+        $completedFiles++
+        $completedBytes += [int64]$entry.Length
+
+        $elapsed = [Math]::Max($watch.Elapsed.TotalSeconds,0.1)
+        $speed = $completedBytes / $elapsed
+        $remaining = [Math]::Max([int64]0,$totalBytes - $completedBytes)
+        $etaSec = if ($speed -gt 0) { [int]($remaining / $speed) } else { 0 }
+        $eta = [TimeSpan]::FromSeconds($etaSec)
+        $progressText = "Общий прогресс: $completedFiles/$totalFiles, $(Format-Size $completedBytes)/$(Format-Size $totalBytes), $(Format-Size ([int64]$speed))/s, осталось ~$($eta.ToString('hh\:mm\:ss'))"
+        Write-Ok $progressText
+    }
+
+    Send-Json $Stream @{type="done"}
+    $done = Receive-Json $Stream
+    if ($done.type -eq "error") { throw [string]$done.message }
+    if ($done.type -ne "done-ok") { throw "Получатель не подтвердил завершение." }
+    $watch.Stop()
+}
+
+function Run-Sender([string]$Exe) {
+    [void](Get-TailscaleIPv4 $Exe)
+
+    if ([string]::IsNullOrWhiteSpace($ConnectionCode)) {
+        Write-Host ""
+        $script:ConnectionCode = Read-Host "Вставьте КОД ПОДКЛЮЧЕНИЯ с компьютера-получателя"
+    }
+
+    $conn = Parse-ConnectionCode $ConnectionCode
+
+    if (-not $Source -or $Source.Count -eq 0) {
+        $script:Source = Read-Sources
+    }
+
+    if (-not $Source -or $Source.Count -eq 0) { throw "Не выбрана ни одна папка или файл." }
+
+    Write-Info "Сканирую все папки и подпапки..."
+    $entries = Get-Entries $Source
+    if ($entries.Count -eq 0) { throw "Нет данных для передачи." }
+
+    $fileEntries = @($entries | Where-Object { $_.Kind -eq "File" })
+    $totalBytes = [int64]0
+    foreach ($f in $fileEntries) { $totalBytes += [int64]$f.Length }
+
+    Write-Host ""
+    Write-Host "Найдено:"
+    Write-Host "  Файлов: $($fileEntries.Count)"
+    Write-Host "  Размер:  $(Format-Size $totalBytes)"
+    Write-Host ""
+
+    $answer = Read-Host "Начать передачу? [Y/n]"
+    if ($answer -and $answer -notmatch '^(y|yes|д|да)$') {
+        Write-Warn "Передача отменена."
+        return
+    }
+
+    Show-Route $Exe $conn.Ip
+
+    $client = New-Object Net.Sockets.TcpClient
+    try {
+        Write-Info "Подключаюсь к $($conn.Ip):$($conn.Port)..."
+        $async = $client.BeginConnect($conn.Ip,$conn.Port,$null,$null)
+        if (-not $async.AsyncWaitHandle.WaitOne(15000)) { throw "Таймаут подключения. Проверьте получателя и код подключения." }
+        $client.EndConnect($async)
+
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 300000
+        $stream.WriteTimeout = 300000
+
+        Send-Json $stream @{type="hello";protocol=$ProtocolVersion;token=$conn.Token;computer=$env:COMPUTERNAME}
+        $hello = Receive-Json $stream
+        if ($hello.type -eq "error") { throw $hello.message }
+        if ($hello.type -ne "hello-ok") { throw "Получатель вернул неизвестный ответ." }
+
+        Write-Ok "Соединение установлено с $($hello.computer)."
+        Send-Entries -Stream $stream -Entries $entries
+
+        Write-Host ""
+        Write-Ok "ВСЕ ФАЙЛЫ УСПЕШНО ПЕРЕДАНЫ."
+    } finally {
+        $client.Close()
+    }
+}
+
+function Menu {
+    Clear-Host
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+    Write-Host "     ПРЯМАЯ ПЕРЕДАЧА ПАПОК - WINDOWS 10 / 11" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+    Write-Host ""
+    Write-Host "1 - ОТПРАВИТЕЛЬ"
+    Write-Host "2 - ПОЛУЧАТЕЛЬ"
+    Write-Host "0 - Выход"
+    Write-Host ""
+
+    switch (Read-Host "Выберите") {
+        "1" { return "Sender" }
+        "2" { return "Receiver" }
+        "0" { return "Exit" }
+        default { throw "Неверный пункт меню." }
+    }
+}
+
+try {
+    Init-Log
+
+    if ($Mode -eq "Menu") {
+        $Mode = Menu
+        if ($Mode -eq "Exit") { exit }
+    }
+
+    $tailscale = Ensure-Tailscale
+
+    if ($Mode -eq "Receiver") { Run-Receiver $tailscale }
+    elseif ($Mode -eq "Sender") { Run-Sender $tailscale }
+}
+catch {
+    Write-Host ""
+    Write-Host "[ОШИБКА] $($_.Exception.Message)" -ForegroundColor Red
+    Log $_.Exception.ToString()
+    if ($LogFile) { Write-Host "Лог: $LogFile" }
+    exit 1
+}
+finally {
+    Remove-TemporaryFirewallRule
+}
+) {
+        throw "Некорректный Tailscale IP в коде подключения."
+    }
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw "В коде подключения отсутствует токен."
+    }
+
+    return [pscustomobject]@{Ip=$ip;Port=$parsedPort;Token=$token}
 }
 
 function Send-Entries {

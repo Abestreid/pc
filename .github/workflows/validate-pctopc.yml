@@ -1,11 +1,11 @@
-name: Validate DirectFolderTransfer
+name: Validate PcToPc
 
 on:
   push:
     branches: [main]
     paths:
-      - 'DirectFolderTransfer.ps1'
-      - '.github/workflows/validate-direct-transfer.yml'
+      - 'PcToPc.ps1'
+      - '.github/workflows/validate-pctopc.yml'
   workflow_dispatch:
 
 jobs:
@@ -18,16 +18,16 @@ jobs:
         run: |
           $tokens = $null
           $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\DirectFolderTransfer.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\PcToPc.ps1", [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) {
             $errors | Format-List *
             exit 1
           }
           Write-Host "Windows PowerShell parser: OK"
 
-          $bytes = [System.IO.File]::ReadAllBytes("$env:GITHUB_WORKSPACE\DirectFolderTransfer.ps1")
+          $bytes = [System.IO.File]::ReadAllBytes("$env:GITHUB_WORKSPACE\PcToPc.ps1")
           if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
-            Write-Error "DirectFolderTransfer.ps1 must be UTF-8 with BOM for Windows PowerShell 5.1 Russian text."
+            Write-Error "PcToPc.ps1 must be UTF-8 with BOM for Windows PowerShell 5.1 Russian text."
             exit 1
           }
           Write-Host "UTF-8 BOM: OK"

@@ -94,7 +94,7 @@ New-Item -ItemType Directory -Force -Path $folder | Out-Null
 $warnings = New-Object 'System.Collections.Generic.List[string]'
 $admin = $false
 try {
-    $principal = New-Object Security.Principal.WindowsPrincipal(
+    $principal = [Security.Principal.WindowsPrincipal]::new(
         [Security.Principal.WindowsIdentity]::GetCurrent())
     $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch {}
@@ -128,7 +128,7 @@ $cpu = @($rawCPU | ForEach-Object {
 $modules = @($rawRAM | Where-Object { $_.Capacity -gt 0 } | ForEach-Object {
     [pscustomobject]@{
         Slot = $_.DeviceLocator; Manufacturer = $_.Manufacturer
-        CapacityGB = GB $_.Capacity; Type = DDR $_.SMBIOSMemoryType $_.MemoryType
+        CapacityGB = (GB $_.Capacity); Type = (DDR $_.SMBIOSMemoryType $_.MemoryType)
         RatedSpeedMHz = $_.Speed; ConfiguredSpeedMHz = $_.ConfiguredClockSpeed
         PartNumber = ([string]$_.PartNumber).Trim()
     }
@@ -184,9 +184,9 @@ $drives = @($rawDisks | ForEach-Object {
     }
     [pscustomobject]@{
         Number = $d.Index; Model = ([string]$d.Model).Trim()
-        CapacityGB = GB $d.Size; MediaType = $type; BusType = $bus
-        WindowsHealth = if ($phys) { [string]$phys.HealthStatus } else { 'Не определено' }
-        StorageReliabilityCounters = Reliability $phys
+        CapacityGB = (GB $d.Size); MediaType = $type; BusType = $bus
+        WindowsHealth = $(if ($phys) { [string]$phys.HealthStatus } else { 'Не определено' })
+        StorageReliabilityCounters = (Reliability $phys)
         SmartctlRawFile = $smartFile
         SmartNote = 'Windows Healthy не означает SMART OK. Сверить атрибуты и ошибки вручную.'
     }
@@ -209,7 +209,7 @@ $gpu = @($rawGPU | ForEach-Object {
     }
     [pscustomobject]@{
         Model = $_.Name; Type = $kind
-        AdapterRAM_GB_Unreliable = GB $_.AdapterRAM
+        AdapterRAM_GB_Unreliable = (GB $_.AdapterRAM)
         Note = 'WMI VRAM может быть ошибочным (особенно 4+ ГБ).'
     }
 })

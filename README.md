@@ -136,7 +136,7 @@ Tailscale используется как защищенная сеть межд
 Запустить PowerShell **от имени администратора** и выполнить:
 
 ```powershell
-$u='https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1'; $f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; Invoke-WebRequest -Uri $u -OutFile $f; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $u='https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1'; $f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $f; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
 Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 10/11, ничего не устанавливает и не меняет системные настройки. Отчёты сохраняются локально на рабочем столе в папке `PC-Sale-Inventory\<имя-ПК>-<дата>`. Данные компьютера **не передаются в GitHub**.

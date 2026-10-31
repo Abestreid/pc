@@ -5,7 +5,7 @@
 .DESCRIPTION
   Read-only hardware inventory. Exports TXT, JSON, CSV, manual checklist,
   and raw SMART logs when smartctl is already installed.
-  Uploads a report archive to Abestreid/pc unless -SkipUpload is specified.
+  Uploads a report archive to test.abeslab.by/pc unless -SkipUpload is specified.
   No settings, activation, drivers, or disks are modified.
 #>
 [CmdletBinding()]
@@ -76,41 +76,18 @@ function PhysicalFor($Disk, $Candidates) {
     $null
 }
 
-function Send-InventoryArchive([string]$Archive, [string]$RepositoryPath) {
-    $token = $env:GH_TOKEN
-    if (-not $token) { $token = $env:GITHUB_TOKEN }
-    if (-not $token -and (Get-Command gh -ErrorAction SilentlyContinue)) {
-        try {
-            $candidate = & gh auth token --hostname github.com 2>$null
-            if ($LASTEXITCODE -eq 0) { $token = ($candidate -join '').Trim() }
-        } catch { $token = $null }
-    }
-    if (-not $token) {
-        Write-Host 'Нужен GitHub token с правом Contents: Read and write для Abestreid/pc.'
-        $secure = Read-Host 'GitHub token (ввод скрыт)' -AsSecureString
-        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try { $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
-        finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-            $secure.Dispose()
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($token)) { throw 'GitHub token не указан.' }
+function Send-InventoryArchive([string]$Archive, [string]$Timestamp) {
+    $bytes = [IO.File]::ReadAllBytes($Archive)
+    if ($bytes.Length -gt 8MB) { throw 'Архив больше 8 МБ. Он сохранён локально; отправьте его владельцу отдельно.' }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    try {
-        $body = @{
-            message = "Add PC inventory $RepositoryPath"
-            branch = 'main'
-            content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Archive))
-        } | ConvertTo-Json -Compress
-        $response = Invoke-RestMethod -Method Put -Uri "https://api.github.com/repos/Abestreid/pc/contents/$RepositoryPath" -Headers @{
-            Authorization = "Bearer $token"
-            Accept = 'application/vnd.github+json'
-            'User-Agent' = 'PcSaleInventory'
-        } -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ErrorAction Stop
-        if (-not $response.content.html_url) { throw 'GitHub не вернул ссылку на файл.' }
-        $response.content.html_url
-    } finally { $token = $null; $body = $null }
+    $response = Invoke-RestMethod -Method Post -Uri 'https://test.abeslab.by/pc/?action=upload' -Headers @{
+        'X-Inventory-Timestamp' = $Timestamp
+    } -ContentType 'application/zip' -Body $bytes -TimeoutSec 120 -ErrorAction Stop
+    $hash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if (-not $response.ok -or $response.sha256 -ne $hash -or $response.url -notmatch '^https://test\.abeslab\.by/pc/\?report=[a-f0-9]{32}$') {
+        throw 'Сервер не подтвердил сохранение архива. Локальная копия сохранена.'
+    }
+    $response.url
 }
 
 if ($PSVersionTable.PSEdition -eq 'Core') {
@@ -319,7 +296,7 @@ $manual = @(
     'Перед продажей: сохранить данные, очистить диск и проверить лицензию Windows'
 )
 $report = [ordered]@{
-    Version='1.1'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+    Version='2.0'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
     ComputerName=$env:COMPUTERNAME; Administrator=$admin
     CPU=$cpu
     RAM=[pscustomobject]@{TotalGB=$ramGB; Type=$ramType; SlotsUsed=$modules.Count; Modules=$modules}
@@ -409,9 +386,9 @@ if ($SkipUpload) {
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [IO.Compression.ZipFile]::CreateFromDirectory($folder, $archive)
-        $repositoryPath = "results/$timestamp/$hostName.zip"
-        Write-Host "Отправляю архив отчётов в Abestreid/pc: $repositoryPath" -ForegroundColor Cyan
-        $url = Send-InventoryArchive $archive $repositoryPath
+        Write-Host 'Отправляю архив отчётов на https://test.abeslab.by/pc/ ...' -ForegroundColor Cyan
+        $url = Send-InventoryArchive $archive $timestamp
+        $url | Out-File -LiteralPath (Join-Path $folder 'report-url.txt') -Encoding UTF8
         Write-Host "Загружено: $url" -ForegroundColor Green
     } catch {
         Write-Host "Загрузка не выполнена. Локальные отчёты сохранены: $folder" -ForegroundColor Yellow

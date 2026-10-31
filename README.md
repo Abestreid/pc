@@ -139,7 +139,13 @@ Tailscale используется как защищенная сеть межд
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $u='https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1'; $f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $f; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
-Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 10/11, ничего не устанавливает и не меняет системные настройки. Отчёты сохраняются локально на рабочем столе в папке `PC-Sale-Inventory\<имя-ПК>-<дата>`. Данные компьютера **не передаются в GitHub**.
+Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 10/11, ничего не устанавливает и не меняет системные настройки. Файл сохранён как UTF-8 с BOM для Windows PowerShell 5.1; при редактировании сохраняйте эту кодировку.
+
+Отчёты сохраняются на рабочем столе в `PC-Sale-Inventory\<имя-ПК>-<ддммггггччммсс>`. Затем скрипт создаёт рядом ZIP-архив и загружает его в этот репозиторий: `results/<ддммггггччммсс>/<имя-ПК>.zip` (ветка `main`). Например: `results/31102026153045/OFFICE-PC.zip`. Используется местное время проверяемого компьютера, формат PowerShell — `ddMMyyyyHHmmss`.
+
+Для загрузки нужен доступ к записи в `Abestreid/pc`: скрипт использует `GH_TOKEN`, затем `GITHUB_TOKEN`, затем авторизацию установленного GitHub CLI (`gh auth login`). Если авторизации нет, попросит ввести токен скрыто. Для fine-grained token выберите репозиторий `Abestreid/pc` и разрешение **Contents: Read and write**. Токен не записывается в отчёт или скрипт. Git и GitHub CLI для запуска не обязательны.
+
+Архив содержит все перечисленные отчёты, имя компьютера и доступные SMART-логи/события Windows; его видимость соответствует видимости репозитория. При ошибке загрузки локальные файлы сохраняются, а скрипт сообщает ошибку. Для сбора только локально добавьте `-SkipUpload` к последней команде запуска: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f -SkipUpload`.
 
 Не определяются достоверно программно: бренд/мощность БП, количество реальных HDMI/DP/VGA/USB, повреждения, шум, перегрев, комплектация, фото. Эти сведения нужно заполнить по чек-листу.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\PC-Inventory.ps1 -Id PC-001

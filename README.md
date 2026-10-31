@@ -133,12 +133,12 @@ Tailscale используется как защищенная сеть межд
 
 Автоматический сбор CPU, RAM (планки и DDR), SSD/HDD, GPU, материнской платы, сетевых устройств, Windows и статуса активации. Результат: `inventory.txt` для объявления, `inventory.json` для машинной обработки, `inventory.csv` для таблицы и `manual-checklist.txt` для ручного осмотра. При наличии установленного `smartctl` сохраняются отдельные сырые SMART-логи. **Windows Healthy не заменяет полноценную SMART-проверку.**
 
-Проще всего: скачайте [PcSaleInventory.cmd](https://test.abeslab.by/pc/PcSaleInventory.cmd) и запустите двойным щелчком (лучше от администратора). Он скачает актуальный скрипт из GitHub и запустит его. Работает и со штатным PowerShell 2.0 на Windows 7.
+Проще всего: скачайте [PcSaleInventory-Win7.cmd](https://test.abeslab.by/pc/PcSaleInventory-Win7.cmd) и запустите двойным щелчком (лучше от администратора). Он скачает актуальный скрипт из GitHub и запустит его. Работает и со штатным PowerShell 2.0 на Windows 7.
 
 Или запустите PowerShell **от имени администратора** и выполните:
 
 ```powershell
-$f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; $v=Join-Path $env:TEMP 'PcInventoryDownload.vbs'; @('Set h=CreateObject("WinHttp.WinHttpRequest.5.1")','h.Open "GET","https://raw.githubusercontent.com/Abestreid/pc/refs/heads/main/PcSaleInventory.ps1",False','h.Option(9)=2048','h.Send','If h.Status<>200 Then WScript.Quit 1','Set s=CreateObject("ADODB.Stream")','s.Type=1:s.Open:s.Write h.ResponseBody:s.SaveToFile WScript.Arguments(0),2:s.Close') | Out-File -FilePath $v -Encoding ASCII; & cscript.exe //nologo $v $f; if($LASTEXITCODE -eq 0){ & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f }
+$ErrorActionPreference='Stop'; $f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; (New-Object Net.WebClient).DownloadFile('http://test.abeslab.by/pc/PcSaleInventory.ps1',$f); $s=[Security.Cryptography.SHA256]::Create(); $h=[BitConverter]::ToString($s.ComputeHash([IO.File]::ReadAllBytes($f))).Replace('-','').ToLowerInvariant(); $s.Clear(); if($h -ne '91836ff59f2e7bd567afcab7b09268a859220032bb8be44610f4fda9089122b1'){throw 'Download verification failed'}; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
 Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 7/10/11, ничего не устанавливает и не меняет системные настройки. Файл сохранён как UTF-8 с BOM для Windows PowerShell 2.0 и новее; при редактировании сохраняйте эту кодировку.
@@ -153,3 +153,5 @@ $f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; $v=Join-Path $env:TEMP 'PcInventor
 
 Не определяются достоверно программно: бренд/мощность БП, количество реальных HDMI/DP/VGA/USB, повреждения, шум, перегрев, комплектация, фото. Эти сведения нужно заполнить по чек-листу.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\PC-Inventory.ps1 -Id PC-001
+
+На Windows 7 с недоступным TLS 1.2 загрузчик и отправка используют резервный HTTP-адрес этого же хостинга; настройки Windows не меняются. Скачанный скрипт проверяется по закреплённому SHA-256 до выполнения. CMD-лаунчер содержит ссылку на конкретный коммит GitHub и контрольную сумму этой версии; после обновления скрипта скачайте свежий лаунчер.

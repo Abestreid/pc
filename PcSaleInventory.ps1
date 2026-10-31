@@ -170,22 +170,48 @@ function Send-InventoryArchive([string]$Archive, [string]$Timestamp) {
     $transport = Join-Path $env:TEMP ('PcInventoryUpload-' + [guid]::NewGuid().ToString('N') + '.vbs')
     $transportCode = @'
 Option Explicit
-Dim http, stream, payload
+Dim http, stream, payload, lastError
 Set stream = CreateObject("ADODB.Stream")
 stream.Type = 1
 stream.Open
 stream.LoadFromFile WScript.Arguments(0)
 payload = stream.Read
 stream.Close
-Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
-http.SetTimeouts 15000, 15000, 120000, 120000
-http.Open "POST", "https://test.abeslab.by/pc/?action=upload", False
-http.Option(9) = 2048
-http.SetRequestHeader "Content-Type", "application/zip"
-http.SetRequestHeader "X-Inventory-Timestamp", WScript.Arguments(1)
-http.Send payload
-WScript.Echo http.ResponseText
-If http.Status <> 201 Then WScript.Quit 1
+Function SendTo(url)
+    On Error Resume Next
+    SendTo = False
+    Err.Clear
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+    http.SetTimeouts 15000, 15000, 30000, 120000
+    http.Open "POST", url, False
+    If Err.Number <> 0 Then
+        lastError = Err.Description
+        Exit Function
+    End If
+    If Left(url, 6) = "https:" Then
+        http.Option(9) = 2048
+        Err.Clear
+    End If
+    http.SetRequestHeader "Content-Type", "application/zip"
+    http.SetRequestHeader "X-Inventory-Timestamp", WScript.Arguments(1)
+    http.Send payload
+    If Err.Number <> 0 Then
+        lastError = Err.Description
+        Exit Function
+    End If
+    If http.Status <> 201 Then
+        WScript.Echo "HTTP " & http.Status & ": " & http.ResponseText
+        WScript.Quit 1
+    End If
+    WScript.Echo http.ResponseText
+    SendTo = True
+End Function
+If Not SendTo("https://test.abeslab.by/pc/?action=upload") Then
+    If Not SendTo("http://test.abeslab.by/pc/?action=upload") Then
+        WScript.Echo "Upload failed: " & lastError
+        WScript.Quit 1
+    End If
+End If
 '@
     try {
         $transportCode | Out-File -FilePath $transport -Encoding ASCII
@@ -406,7 +432,7 @@ $manual = @(
     'Перед продажей: сохранить данные, очистить диск и проверить лицензию Windows'
 )
 $report = @{
-    Version='2.1'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+    Version='2.2'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
     ComputerName=$env:COMPUTERNAME; Administrator=$admin
     CPU=$cpu
     RAM=New-Object PSObject -Property @{TotalGB=$ramGB; Type=$ramType; SlotsUsed=$modules.Count; Modules=$modules}

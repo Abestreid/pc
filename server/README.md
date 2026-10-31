@@ -2,7 +2,11 @@
 
 PHP 8.2 with ZipArchive. No database, Composer, GitHub token or client secret required.
 
-Deploy `pc/index.php`, `pc/.htaccess`, `pc/.user.ini`, plus the repository's **UTF-8 BOM** `PcSaleInventory.ps1` to `/hosting1/abeslabby/test.abeslab.by/pc/`.
+Deploy `pc/index.php`, `pc/.htaccess`, `pc/.user.ini`, plus the repository's **UTF-8 BOM** `PcSaleInventory.ps1`, `PcSaleInventory.cmd` and `launch-command.txt` to `/hosting1/abeslabby/test.abeslab.by/pc/`.
+
+The CMD launcher downloads the current script from GitHub using built-in VBScript/WinHTTP and starts the default Windows PowerShell. The copyable PowerShell command uses the same download path and works on PowerShell 2.0. The inventory uses WMI when CIM is unavailable, a .NET 2-compatible JSON writer and stored ZIP writer, and VBScript/WinHTTP for TLS 1.2 uploads (avoids PowerShell 2's COM Option binding issue). No framework upgrade, PowerShell installation or registry changes are performed. Windows 7 still needs working system TLS 1.2 and certificate trust to reach HTTPS services.
+
+Compatibility checks ran in the actual PowerShell **2.0 / CLR 2.0.50727** engine and PowerShell **5.1 / CLR 4** on the deployment workstation, using fictional hardware through the WMI fallback. Both uploaded to the live endpoint; downloaded ZIP bytes/SHA-256 matched. This verifies the old runtime, not a physical Windows 7 installation. Run `powershell.exe -Version 2 -NoProfile -ExecutionPolicy Bypass -File tests/Compatibility.ps1 -ScriptPath ./PcSaleInventory.ps1 -OutputRoot ./work/ps2-test` for a local fixture-only check; `-Upload` additionally uploads the fictional TEST-WIN7-PS2 report.
 
 Create `/hosting1/abeslabby/pc-inventory-data/config.php` **outside the web root** using `config.example.php`. Set `storage` to that directory, `base_url` to `https://test.abeslab.by/pc`, and generate a random 32-byte hex `rate_salt` for hashing IP addresses. Do not commit the real config or reports. The PHP process needs write access to this directory. For local tests the config path can be set through `PC_INVENTORY_CONFIG`.
 

@@ -133,13 +133,15 @@ Tailscale используется как защищенная сеть межд
 
 Автоматический сбор CPU, RAM (планки и DDR), SSD/HDD, GPU, материнской платы, сетевых устройств, Windows и статуса активации. Результат: `inventory.txt` для объявления, `inventory.json` для машинной обработки, `inventory.csv` для таблицы и `manual-checklist.txt` для ручного осмотра. При наличии установленного `smartctl` сохраняются отдельные сырые SMART-логи. **Windows Healthy не заменяет полноценную SMART-проверку.**
 
-Запустить PowerShell **от имени администратора** и выполнить:
+Проще всего: скачайте [PcSaleInventory.cmd](https://test.abeslab.by/pc/PcSaleInventory.cmd) и запустите двойным щелчком (лучше от администратора). Он скачает актуальный скрипт из GitHub и запустит его. Работает и со штатным PowerShell 2.0 на Windows 7.
+
+Или запустите PowerShell **от имени администратора** и выполните:
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $u='https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1'; $f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $f; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f
+$f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; $v=Join-Path $env:TEMP 'PcInventoryDownload.vbs'; @('Set h=CreateObject("WinHttp.WinHttpRequest.5.1")','h.Open "GET","https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1",False','h.Option(9)=2048','h.Send','If h.Status<>200 Then WScript.Quit 1','Set s=CreateObject("ADODB.Stream")','s.Type=1:s.Open:s.Write h.ResponseBody:s.SaveToFile WScript.Arguments(0),2:s.Close') | Out-File -FilePath $v -Encoding ASCII; & cscript.exe //nologo $v $f; if($LASTEXITCODE -eq 0){ & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f }
 ```
 
-Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 10/11, ничего не устанавливает и не меняет системные настройки. Файл сохранён как UTF-8 с BOM для Windows PowerShell 5.1; при редактировании сохраняйте эту кодировку.
+Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 7/10/11, ничего не устанавливает и не меняет системные настройки. Файл сохранён как UTF-8 с BOM для Windows PowerShell 2.0 и новее; при редактировании сохраняйте эту кодировку.
 
 Отчёты сохраняются на рабочем столе в `PC-Sale-Inventory\<имя-ПК>-<ддммггггччммсс>`. Затем скрипт создаёт рядом ZIP-архив и отправляет его на **[test.abeslab.by/pc](https://test.abeslab.by/pc/)**. GitHub-токен и установка дополнительных программ не нужны. Архив на сервере называется, например, `31102026153045-OFFICE-PC.zip`. Используется местное время проверяемого компьютера, формат PowerShell — `ddMMyyyyHHmmss`.
 

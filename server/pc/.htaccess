@@ -1,5 +1,11 @@
 Options -Indexes
 DirectoryIndex index.php
+<Files "PcSaleInventory.cmd">
+    ForceType application/octet-stream
+    <IfModule mod_headers.c>
+        Header set Content-Disposition "attachment; filename=PcSaleInventory.cmd"
+    </IfModule>
+</Files>
 <FilesMatch "^(?:config|\.)">
     Require all denied
 </FilesMatch>

@@ -1,7 +1,7 @@
-﻿#requires -Version 5.1
+﻿#requires -Version 2.0
 <#
 .SYNOPSIS
-  Inventory of Windows 10/11 computers before resale.
+  Inventory of Windows 7/10/11 computers before resale.
 .DESCRIPTION
   Read-only hardware inventory. Exports TXT, JSON, CSV, manual checklist,
   and raw SMART logs when smartctl is already installed.
@@ -12,8 +12,95 @@
 param([string]$OutputDirectory, [switch]$SkipUpload)
 
 $ErrorActionPreference = 'Stop'
+# This helper uses only .NET 2.0 APIs, including on stock Windows 7/PowerShell 2.
+if (-not ('PcInventoryPortable' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+public static class PcInventoryPortable {
+    public static string Quote(string text) {
+        StringBuilder s = new StringBuilder("\"");
+        foreach (char c in text) {
+            if (c == '"' || c == '\\') { s.Append('\\'); s.Append(c); }
+            else if (c < 32) { s.Append("\\u"); s.Append(((int)c).ToString("x4")); }
+            else { s.Append(c); }
+        }
+        return s.Append('"').ToString();
+    }
+    public static string Sha256(string path) {
+        using (SHA256 hash = SHA256.Create())
+        using (FileStream f = File.OpenRead(path)) {
+            return BitConverter.ToString(hash.ComputeHash(f)).Replace("-", "").ToLowerInvariant();
+        }
+    }
+    static uint Crc(byte[] bytes) {
+        uint crc = 0xffffffffU;
+        foreach (byte b in bytes) {
+            crc ^= b;
+            for (int i = 0; i < 8; i++) { crc = (crc >> 1) ^ ((crc & 1) != 0 ? 0xedb88320U : 0U); }
+        }
+        return crc ^ 0xffffffffU;
+    }
+    public static void Zip(string directory, string archive) {
+        List<byte[]> names = new List<byte[]>(); List<uint> sizes = new List<uint>();
+        List<uint> crcs = new List<uint>(); List<uint> offsets = new List<uint>();
+        // Stored ZIP entries avoid requiring .NET 4.5 or Explorer/third-party archivers.
+        using (FileStream f = new FileStream(archive, FileMode.CreateNew, FileAccess.Write))
+        using (BinaryWriter w = new BinaryWriter(f)) {
+            foreach (string path in Directory.GetFiles(directory)) {
+                byte[] data = File.ReadAllBytes(path), name = Encoding.UTF8.GetBytes(Path.GetFileName(path));
+                uint size = (uint)data.Length, crc = Crc(data), offset = (uint)f.Position;
+                names.Add(name); sizes.Add(size); crcs.Add(crc); offsets.Add(offset);
+                w.Write(0x04034b50U); w.Write((ushort)20); w.Write((ushort)0x800); w.Write((ushort)0);
+                w.Write((ushort)0); w.Write((ushort)33); w.Write(crc); w.Write(size); w.Write(size);
+                w.Write((ushort)name.Length); w.Write((ushort)0); w.Write(name); w.Write(data);
+            }
+            uint central = (uint)f.Position;
+            for (int i = 0; i < names.Count; i++) {
+                w.Write(0x02014b50U); w.Write((ushort)20); w.Write((ushort)20); w.Write((ushort)0x800);
+                w.Write((ushort)0); w.Write((ushort)0); w.Write((ushort)33); w.Write(crcs[i]);
+                w.Write(sizes[i]); w.Write(sizes[i]); w.Write((ushort)names[i].Length);
+                w.Write((ushort)0); w.Write((ushort)0); w.Write((ushort)0); w.Write((ushort)0);
+                w.Write(0U); w.Write(offsets[i]); w.Write(names[i]);
+            }
+            uint length = (uint)f.Position - central;
+            w.Write(0x06054b50U); w.Write((ushort)0); w.Write((ushort)0);
+            w.Write((ushort)names.Count); w.Write((ushort)names.Count); w.Write(length); w.Write(central); w.Write((ushort)0);
+        }
+    }
+}
+'@
+}
+function InventoryJson($Value) {
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string] -or $Value -is [char] -or $Value -is [datetime]) { return [PcInventoryPortable]::Quote([string]$Value) }
+    if ($Value -is [bool]) { return ([string]$Value).ToLowerInvariant() }
+    if ($Value -is [ValueType]) { return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture) }
+    $parts = @()
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) { $parts += ([PcInventoryPortable]::Quote([string]$key) + ':' + (InventoryJson $Value[$key])) }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        foreach ($item in $Value) { $parts += (InventoryJson $item) }
+        return '[' + ($parts -join ',') + ']'
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        $parts += ([PcInventoryPortable]::Quote($property.Name) + ':' + (InventoryJson $property.Value))
+    }
+    return '{' + ($parts -join ',') + '}'
+}
 function Cim([string]$Name, [string]$Namespace = 'root/cimv2') {
-    try { @(Get-CimInstance -ClassName $Name -Namespace $Namespace -ErrorAction Stop) }
+    try {
+        if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+            @(Get-CimInstance -ClassName $Name -Namespace $Namespace -ErrorAction Stop)
+        } else {
+            @(Get-WmiObject -Class $Name -Namespace $Namespace -ErrorAction Stop)
+        }
+    }
     catch { @() }
 }
 function GB($Bytes) {
@@ -50,7 +137,7 @@ function Reliability($Physical) {
     try {
         $v = $Physical | Get-StorageReliabilityCounter -ErrorAction Stop
         if (-not $v) { return $null }
-        [pscustomobject]@{
+        New-Object PSObject -Property @{
             TemperatureC = $v.Temperature
             WearPercentConsumed = $v.Wear
             PowerOnHours = $v.PowerOnHours
@@ -79,15 +166,39 @@ function PhysicalFor($Disk, $Candidates) {
 function Send-InventoryArchive([string]$Archive, [string]$Timestamp) {
     $bytes = [IO.File]::ReadAllBytes($Archive)
     if ($bytes.Length -gt 8MB) { throw 'Архив больше 8 МБ. Он сохранён локально; отправьте его владельцу отдельно.' }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $response = Invoke-RestMethod -Method Post -Uri 'https://test.abeslab.by/pc/?action=upload' -Headers @{
-        'X-Inventory-Timestamp' = $Timestamp
-    } -ContentType 'application/zip' -Body $bytes -TimeoutSec 120 -ErrorAction Stop
-    $hash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    if (-not $response.ok -or $response.sha256 -ne $hash -or $response.url -notmatch '^https://test\.abeslab\.by/pc/\?report=[a-f0-9]{32}$') {
+    # VBScript calls WinHTTP directly: PS2's COM adapter cannot reliably set Option(9).
+    $transport = Join-Path $env:TEMP ('PcInventoryUpload-' + [guid]::NewGuid().ToString('N') + '.vbs')
+    $transportCode = @'
+Option Explicit
+Dim http, stream, payload
+Set stream = CreateObject("ADODB.Stream")
+stream.Type = 1
+stream.Open
+stream.LoadFromFile WScript.Arguments(0)
+payload = stream.Read
+stream.Close
+Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+http.SetTimeouts 15000, 15000, 120000, 120000
+http.Open "POST", "https://test.abeslab.by/pc/?action=upload", False
+http.Option(9) = 2048
+http.SetRequestHeader "Content-Type", "application/zip"
+http.SetRequestHeader "X-Inventory-Timestamp", WScript.Arguments(1)
+http.Send payload
+WScript.Echo http.ResponseText
+If http.Status <> 201 Then WScript.Quit 1
+'@
+    try {
+        $transportCode | Out-File -FilePath $transport -Encoding ASCII
+        $response = (& cscript.exe //nologo $transport (Get-Item -LiteralPath $Archive).FullName $Timestamp) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw ('Ошибка отправки отчёта: ' + $response) }
+    } finally { if (Test-Path -LiteralPath $transport) { Remove-Item -LiteralPath $transport -Force } }
+    $hash = [PcInventoryPortable]::Sha256($Archive)
+    $urlMatch = [regex]::Match($response, '"url"\s*:\s*"(https://test\.abeslab\.by/pc/\?report=[a-f0-9]{32})"')
+    $shaMatch = [regex]::Match($response, '"sha256"\s*:\s*"([a-f0-9]{64})"')
+    if ($response -notmatch '"ok"\s*:\s*true' -or -not $urlMatch.Success -or $shaMatch.Groups[1].Value -ne $hash) {
         throw 'Сервер не подтвердил сохранение архива. Локальная копия сохранена.'
     }
-    $response.url
+    $urlMatch.Groups[1].Value
 }
 
 if ($PSVersionTable.PSEdition -eq 'Core') {
@@ -96,7 +207,7 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
         throw 'Скрипт работает только на Windows.'
     }
 }
-if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+if ((-not $OutputDirectory -or -not $OutputDirectory.Trim())) {
     $base = [Environment]::GetFolderPath('Desktop')
     if (-not $base -or -not (Test-Path -LiteralPath $base)) {
         $base = [Environment]::GetFolderPath('MyDocuments')
@@ -111,8 +222,7 @@ New-Item -ItemType Directory -Path $folder | Out-Null
 $warnings = New-Object 'System.Collections.Generic.List[string]'
 $admin = $false
 try {
-    $principal = [Security.Principal.WindowsPrincipal]::new(
-        [Security.Principal.WindowsIdentity]::GetCurrent())
+    $principal = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
     $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch {}
 
@@ -136,14 +246,14 @@ $cpu = @($rawCPU | ForEach-Object {
         if ($digits.Length -eq 4) { $generation = $digits.Substring(0,1) + '-е Intel Core (по названию)' }
         elseif ($digits.Length -eq 5) { $generation = $digits.Substring(0,2) + '-е Intel Core (по названию)' }
     }
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Manufacturer = $_.Manufacturer; Model = $model; Generation = $generation
         Cores = $_.NumberOfCores; Threads = $_.NumberOfLogicalProcessors
         MaxClockMHz = $_.MaxClockSpeed
     }
 })
 $modules = @($rawRAM | Where-Object { $_.Capacity -gt 0 } | ForEach-Object {
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Slot = $_.DeviceLocator; Manufacturer = $_.Manufacturer
         CapacityGB = (GB $_.Capacity); Type = (DDR $_.SMBIOSMemoryType $_.MemoryType)
         RatedSpeedMHz = $_.Speed; ConfiguredSpeedMHz = $_.ConfiguredClockSpeed
@@ -183,7 +293,7 @@ $drives = @($rawDisks | ForEach-Object {
         $bus = [string]$wd[0].BusType
     } elseif ($phys) { $bus = [string]$phys.BusType }
     $type = 'Не определено'
-    if ($phys -and [string]$phys.MediaType -in @('SSD','HDD')) {
+    if ($phys -and @('SSD','HDD') -contains [string]$phys.MediaType) {
         $type = [string]$phys.MediaType
     } elseif ($d.Model -match 'SSD|Solid State|NVMe') {
         $type = 'SSD (по модели, проверить)'
@@ -192,14 +302,14 @@ $drives = @($rawDisks | ForEach-Object {
     if ($smartctl) {
         $smartFile = "smartctl-disk-$($d.Index).txt"
         try {
-            $smartText = & $smartctl.Source -a "/dev/pd$($d.Index)" 2>&1 | Out-String
-            $smartText | Out-File -LiteralPath (Join-Path $folder $smartFile) -Encoding UTF8
+            $smartText = & $smartctl.Definition -a "/dev/pd$($d.Index)" 2>&1 | Out-String
+            $smartText | Out-File -FilePath (Join-Path $folder $smartFile) -Encoding UTF8
         } catch {
             "Ошибка чтения SMART: $($_.Exception.Message)" |
-                Out-File -LiteralPath (Join-Path $folder $smartFile) -Encoding UTF8
+                Out-File -FilePath (Join-Path $folder $smartFile) -Encoding UTF8
         }
     }
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Number = $d.Index; Model = ([string]$d.Model).Trim()
         CapacityGB = (GB $d.Size); MediaType = $type; BusType = $bus
         WindowsHealth = $(if ($phys) { [string]$phys.HealthStatus } else { 'Не определено' })
@@ -224,31 +334,31 @@ $gpu = @($rawGPU | ForEach-Object {
     } elseif ($_.Name -match 'NVIDIA|GeForce|Quadro|RTX|GTX|Radeon RX|Radeon Pro') {
         $kind = 'Предположительно дискретная'
     }
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Model = $_.Name; Type = $kind
         AdapterRAM_GB_Unreliable = (GB $_.AdapterRAM)
         Note = 'WMI VRAM может быть ошибочным (особенно 4+ ГБ).'
     }
 })
 $board = if ($rawBoard.Count) {
-    [pscustomobject]@{ Manufacturer=$rawBoard[0].Manufacturer; Model=$rawBoard[0].Product }
-} else { [pscustomobject]@{ Manufacturer='Не определено'; Model='Не определено' } }
+    New-Object PSObject -Property @{ Manufacturer=$rawBoard[0].Manufacturer; Model=$rawBoard[0].Product }
+} else { New-Object PSObject -Property @{ Manufacturer='Не определено'; Model='Не определено' } }
 $chipsetClues = @($rawPnP | Where-Object {
     $_.Name -match 'Chipset Family|LPC Controller|SMBus Controller|Host Bridge'
 } | Select-Object -First 12 -ExpandProperty Name)
 $case = if ($rawCase.Count) { Chassis $rawCase[0].ChassisTypes } else { 'Не определено' }
 $oem = if ($rawComputer.Count) {
-    [pscustomobject]@{ Manufacturer=$rawComputer[0].Manufacturer; Model=$rawComputer[0].Model }
-} else { [pscustomobject]@{ Manufacturer='Не определено'; Model='Не определено' } }
+    New-Object PSObject -Property @{ Manufacturer=$rawComputer[0].Manufacturer; Model=$rawComputer[0].Model }
+} else { New-Object PSObject -Property @{ Manufacturer='Не определено'; Model='Не определено' } }
 $os = if ($rawOS.Count) {
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Name=$rawOS[0].Caption; Version=$rawOS[0].Version
         Build=$rawOS[0].BuildNumber; Architecture=$rawOS[0].OSArchitecture
     }
-} else { [pscustomobject]@{ Name='Не определено'; Version=''; Build=''; Architecture='' } }
+} else { New-Object PSObject -Property @{ Name='Не определено'; Version=''; Build=''; Architecture='' } }
 $activation = 'Не удалось проверить'
 try {
-    $licensed = @(Get-CimInstance Win32_SoftwareLicensingProduct -ErrorAction Stop |
+    $licensed = @(Cim 'SoftwareLicensingProduct' |
         Where-Object { $_.Name -like 'Windows*' -and $_.PartialProductKey })
     if (@($licensed | Where-Object { $_.LicenseStatus -eq 1 }).Count) {
         $activation = 'Активирована на момент проверки'
@@ -258,7 +368,7 @@ try {
 } catch { $warnings.Add('Статус лицензирования Windows недоступен.') }
 
 $network = @($rawNet | Where-Object { $_.PhysicalAdapter -and $_.Name } | ForEach-Object {
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Name=$_.Name; Connection=$_.NetConnectionID
         ConnectedNow=($_.NetConnectionStatus -eq 2)
     }
@@ -275,7 +385,7 @@ try {
     } -MaxEvents 120 -ErrorAction Stop | Where-Object {
         $_.ProviderName -match 'disk|stor|ntfs|nvme'
     } | Select-Object -First 25 | ForEach-Object {
-        [pscustomobject]@{
+        New-Object PSObject -Property @{
             Time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm')
             Source=$_.ProviderName; EventID=$_.Id
             Message=([string]$_.Message -replace '\s+',' ').Trim()
@@ -295,16 +405,16 @@ $manual = @(
     'SMART: проверить Reallocated/Pending/Uncorrectable; SSD wear/spare/used',
     'Перед продажей: сохранить данные, очистить диск и проверить лицензию Windows'
 )
-$report = [ordered]@{
-    Version='2.0'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+$report = @{
+    Version='2.1'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
     ComputerName=$env:COMPUTERNAME; Administrator=$admin
     CPU=$cpu
-    RAM=[pscustomobject]@{TotalGB=$ramGB; Type=$ramType; SlotsUsed=$modules.Count; Modules=$modules}
+    RAM=New-Object PSObject -Property @{TotalGB=$ramGB; Type=$ramType; SlotsUsed=$modules.Count; Modules=$modules}
     Drives=$drives; GPU=$gpu
     Motherboard=$board; ChipsetCluesUnverified=$chipsetClues
     OEM=$oem; ChassisFromSMBIOS=$case
     PowerSupply='Не определяется программно: ручной осмотр'
-    Connections=[pscustomobject]@{
+    Connections=New-Object PSObject -Property @{
         NetworkAdapters=$network; WiFiDetected=($wifi.Count -gt 0)
         BluetoothDevicesUnverified=$bluetooth; USBControllers=$usbControllers
         PhysicalPortCounts='Требуют ручного осмотра'
@@ -359,21 +469,21 @@ $txt.Add('ВАЖНО: Healthy не подтверждает исправност
 $txt.Add('ПРЕДУПРЕЖДЕНИЯ:')
 foreach ($w in $warnings) { $txt.Add(' - ' + $w) }
 
-($report | ConvertTo-Json -Depth 10) | Out-File -LiteralPath (Join-Path $folder 'inventory.json') -Encoding UTF8
-$txt | Out-File -LiteralPath (Join-Path $folder 'inventory.txt') -Encoding UTF8
+(InventoryJson $report) | Out-File -FilePath (Join-Path $folder 'inventory.json') -Encoding UTF8
+$txt | Out-File -FilePath (Join-Path $folder 'inventory.txt') -Encoding UTF8
 @('РУЧНАЯ ПРОВЕРКА ПЕРЕД ОБЪЯВЛЕНИЕМ','') + @($manual | ForEach-Object { '[ ] ' + $_ }) |
-    Out-File -LiteralPath (Join-Path $folder 'manual-checklist.txt') -Encoding UTF8
-[pscustomobject]@{
+    Out-File -FilePath (Join-Path $folder 'manual-checklist.txt') -Encoding UTF8
+New-Object PSObject -Property @{
     ComputerName=$env:COMPUTERNAME; Date=$report.CollectedAt
     CPU=$cpuTitle; Cores=(@($cpu | Measure-Object Cores -Sum).Sum)
     Threads=(@($cpu | Measure-Object Threads -Sum).Sum)
     RAM_GB=$ramGB; DDR=$ramType; RAM_Modules=$modules.Count
     Drives=(@($drives | ForEach-Object { "$($_.MediaType) $($_.CapacityGB) GB $($_.Model)" }) -join '; ')
-    GPU=(@($gpu | ForEach-Object Model) -join '; ')
+    GPU=(@($gpu | ForEach-Object { $_.Model }) -join '; ')
     Motherboard="$($board.Manufacturer) $($board.Model)"
     Case=$case; OS=$os.Name; WindowsActivated=$activation
     ManualCheckPending='Да'
-} | Export-Csv -LiteralPath (Join-Path $folder 'inventory.csv') -Delimiter ';' -Encoding UTF8 -NoTypeInformation
+} | Export-Csv -Path (Join-Path $folder 'inventory.csv') -Delimiter ';' -Encoding UTF8 -NoTypeInformation
 Write-Host ''
 Write-Host 'ГОТОВО. Отчёты сохранены:' -ForegroundColor Green
 Write-Host $folder
@@ -384,11 +494,10 @@ if ($SkipUpload) {
 } else {
     $archive = "$folder.zip"
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [IO.Compression.ZipFile]::CreateFromDirectory($folder, $archive)
+        [PcInventoryPortable]::Zip($folder, $archive)
         Write-Host 'Отправляю архив отчётов на https://test.abeslab.by/pc/ ...' -ForegroundColor Cyan
         $url = Send-InventoryArchive $archive $timestamp
-        $url | Out-File -LiteralPath (Join-Path $folder 'report-url.txt') -Encoding UTF8
+        $url | Out-File -FilePath (Join-Path $folder 'report-url.txt') -Encoding UTF8
         Write-Host "Загружено: $url" -ForegroundColor Green
     } catch {
         Write-Host "Загрузка не выполнена. Локальные отчёты сохранены: $folder" -ForegroundColor Yellow

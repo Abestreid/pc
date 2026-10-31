@@ -140,7 +140,7 @@ else {
     }
     usort($reports, static fn($a, $b) => strcmp($b['received_at'], $a['received_at']));
 }
-$command = "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \$u='https://test.abeslab.by/pc/PcSaleInventory.ps1'; \$f=Join-Path \$env:TEMP 'PcSaleInventory.ps1'; Invoke-WebRequest -UseBasicParsing -Uri \$u -OutFile \$f; powershell.exe -NoProfile -ExecutionPolicy Bypass -File \$f";
+$command = trim(file_get_contents(__DIR__ . '/launch-command.txt'));
 header('Content-Type: text/html; charset=utf-8');
 ?>
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Инвентаризация ПК · ABESLAB</title>
@@ -150,9 +150,9 @@ header('Content-Type: text/html; charset=utf-8');
 <div class="brand">ABESLAB / PC</div>
 <h1>Характеристики ПК.<br>Один запуск — готовый отчёт.</h1>
 <p class="intro">Соберите конфигурацию Windows перед продажей. Отчёт сохранится на компьютере и отправится сюда автоматически — без GitHub-токена.</p>
-<section class="panel"><h2>Запустить проверку</h2><div class="steps"><span>1. Откройте PowerShell от администратора</span><span>2. Вставьте команду и нажмите Enter</span></div>
+<section class="panel"><h2>Запустить проверку</h2><p><a class="button" href="PcSaleInventory.cmd" download>Скачать запуск для Windows 7 / 10 / 11</a></p><p>Откройте скачанный CMD-файл — он возьмёт актуальный скрипт из GitHub и запустит сбор. Или выполните команду ниже:</p><div class="steps"><span>1. Откройте PowerShell от администратора</span><span>2. Вставьте команду и нажмите Enter</span></div>
 <code id="command"><?= h($command) ?></code><button id="copy" type="button">Скопировать команду</button>
-<p class="muted">Windows 10/11 · CPU, RAM, диски, GPU, плата, сеть и Windows. Системные настройки не меняются. После сбора появится индивидуальная ссылка на результат.</p></section>
+<p class="muted">Windows 7/10/11 · CPU, RAM, диски, GPU, плата, сеть и Windows. Системные настройки не меняются. После сбора появится индивидуальная ссылка на результат.</p></section>
 <section class="panel"><h2>Уже есть ZIP-отчёт?</h2><p>Можно отправить архив, который сохранился после предыдущего запуска.</p>
 <form id="upload"><label>Архив отчёта (до 8 МБ)<br><input type="file" name="archive" accept=".zip" required></label><br><button type="submit">Отправить отчёт</button></form><p class="status" id="status" aria-live="polite"></p></section>
 <section class="panel"><h2><?= $selected ? 'Отчёт получен' : 'Все отчёты · ' . count($reports) ?></h2>

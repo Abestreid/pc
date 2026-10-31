@@ -1,14 +1,15 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Inventory of Windows 10/11 computers before resale.
 .DESCRIPTION
   Read-only hardware inventory. Exports TXT, JSON, CSV, manual checklist,
   and raw SMART logs when smartctl is already installed.
+  Uploads a report archive to Abestreid/pc unless -SkipUpload is specified.
   No settings, activation, drivers, or disks are modified.
 #>
 [CmdletBinding()]
-param([string]$OutputDirectory)
+param([string]$OutputDirectory, [switch]$SkipUpload)
 
 $ErrorActionPreference = 'Stop'
 function Cim([string]$Name, [string]$Namespace = 'root/cimv2') {
@@ -75,6 +76,43 @@ function PhysicalFor($Disk, $Candidates) {
     $null
 }
 
+function Send-InventoryArchive([string]$Archive, [string]$RepositoryPath) {
+    $token = $env:GH_TOKEN
+    if (-not $token) { $token = $env:GITHUB_TOKEN }
+    if (-not $token -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+        try {
+            $candidate = & gh auth token --hostname github.com 2>$null
+            if ($LASTEXITCODE -eq 0) { $token = ($candidate -join '').Trim() }
+        } catch { $token = $null }
+    }
+    if (-not $token) {
+        Write-Host 'Нужен GitHub token с правом Contents: Read and write для Abestreid/pc.'
+        $secure = Read-Host 'GitHub token (ввод скрыт)' -AsSecureString
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try { $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
+        finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            $secure.Dispose()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($token)) { throw 'GitHub token не указан.' }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    try {
+        $body = @{
+            message = "Add PC inventory $RepositoryPath"
+            branch = 'main'
+            content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Archive))
+        } | ConvertTo-Json -Compress
+        $response = Invoke-RestMethod -Method Put -Uri "https://api.github.com/repos/Abestreid/pc/contents/$RepositoryPath" -Headers @{
+            Authorization = "Bearer $token"
+            Accept = 'application/vnd.github+json'
+            'User-Agent' = 'PcSaleInventory'
+        } -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ErrorAction Stop
+        if (-not $response.content.html_url) { throw 'GitHub не вернул ссылку на файл.' }
+        $response.content.html_url
+    } finally { $token = $null; $body = $null }
+}
+
 if ($PSVersionTable.PSEdition -eq 'Core') {
     if (-not [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
         [Runtime.InteropServices.OSPlatform]::Windows)) {
@@ -89,8 +127,10 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $base 'PC-Sale-Inventory'
 }
 $hostName = $env:COMPUTERNAME -replace '[^A-Za-z0-9_.-]','_'
-$folder = Join-Path $OutputDirectory ("{0}-{1}" -f $hostName,(Get-Date -Format 'yyyyMMdd-HHmmss'))
-New-Item -ItemType Directory -Force -Path $folder | Out-Null
+$timestamp = Get-Date -Format 'ddMMyyyyHHmmss'
+$folder = Join-Path $OutputDirectory ("{0}-{1}" -f $hostName,$timestamp)
+if (Test-Path -LiteralPath $folder) { throw "Папка уже существует: $folder. Повторите запуск через секунду." }
+New-Item -ItemType Directory -Path $folder | Out-Null
 $warnings = New-Object 'System.Collections.Generic.List[string]'
 $admin = $false
 try {
@@ -279,7 +319,7 @@ $manual = @(
     'Перед продажей: сохранить данные, очистить диск и проверить лицензию Windows'
 )
 $report = [ordered]@{
-    Version='1.0'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+    Version='1.1'; CollectedAt=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
     ComputerName=$env:COMPUTERNAME; Administrator=$admin
     CPU=$cpu
     RAM=[pscustomobject]@{TotalGB=$ramGB; Type=$ramType; SlotsUsed=$modules.Count; Modules=$modules}
@@ -362,4 +402,19 @@ Write-Host 'ГОТОВО. Отчёты сохранены:' -ForegroundColor Gre
 Write-Host $folder
 Write-Host 'inventory.txt / inventory.json / inventory.csv / manual-checklist.txt'
 if ($smartctl) { Write-Host 'Дополнительно: smartctl-disk-*.txt (если накопитель отвечает)' }
-Write-Host 'Отчёты никуда не отправлялись.' -ForegroundColor Yellow
+if ($SkipUpload) {
+    Write-Host 'Загрузка отключена параметром -SkipUpload.' -ForegroundColor Yellow
+} else {
+    $archive = "$folder.zip"
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::CreateFromDirectory($folder, $archive)
+        $repositoryPath = "results/$timestamp/$hostName.zip"
+        Write-Host "Отправляю архив отчётов в Abestreid/pc: $repositoryPath" -ForegroundColor Cyan
+        $url = Send-InventoryArchive $archive $repositoryPath
+        Write-Host "Загружено: $url" -ForegroundColor Green
+    } catch {
+        Write-Host "Загрузка не выполнена. Локальные отчёты сохранены: $folder" -ForegroundColor Yellow
+        throw
+    }
+}

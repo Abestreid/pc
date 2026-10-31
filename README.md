@@ -138,7 +138,7 @@ Tailscale используется как защищенная сеть межд
 Или запустите PowerShell **от имени администратора** и выполните:
 
 ```powershell
-$f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; $v=Join-Path $env:TEMP 'PcInventoryDownload.vbs'; @('Set h=CreateObject("WinHttp.WinHttpRequest.5.1")','h.Open "GET","https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1",False','h.Option(9)=2048','h.Send','If h.Status<>200 Then WScript.Quit 1','Set s=CreateObject("ADODB.Stream")','s.Type=1:s.Open:s.Write h.ResponseBody:s.SaveToFile WScript.Arguments(0),2:s.Close') | Out-File -FilePath $v -Encoding ASCII; & cscript.exe //nologo $v $f; if($LASTEXITCODE -eq 0){ & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f }
+$f=Join-Path $env:TEMP 'PcSaleInventory.ps1'; $v=Join-Path $env:TEMP 'PcInventoryDownload.vbs'; @('Set h=CreateObject("WinHttp.WinHttpRequest.5.1")','h.Open "GET","https://raw.githubusercontent.com/Abestreid/pc/refs/heads/main/PcSaleInventory.ps1",False','h.Option(9)=2048','h.Send','If h.Status<>200 Then WScript.Quit 1','Set s=CreateObject("ADODB.Stream")','s.Type=1:s.Open:s.Write h.ResponseBody:s.SaveToFile WScript.Arguments(0),2:s.Close') | Out-File -FilePath $v -Encoding ASCII; & cscript.exe //nologo $v $f; if($LASTEXITCODE -eq 0){ & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f }
 ```
 
 Файл: [`PcSaleInventory.ps1`](PcSaleInventory.ps1). Работает на Windows 7/10/11, ничего не устанавливает и не меняет системные настройки. Файл сохранён как UTF-8 с BOM для Windows PowerShell 2.0 и новее; при редактировании сохраняйте эту кодировку.

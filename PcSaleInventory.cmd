@@ -7,7 +7,7 @@ set "PC_LOADER=%TEMP%\PcInventoryDownload.vbs"
 >>"%PC_LOADER%" echo Dim h, s
 >>"%PC_LOADER%" echo Set h = CreateObject("WinHttp.WinHttpRequest.5.1")
 >>"%PC_LOADER%" echo h.SetTimeouts 15000, 15000, 120000, 120000
->>"%PC_LOADER%" echo h.Open "GET", "https://raw.githubusercontent.com/Abestreid/pc/main/PcSaleInventory.ps1", False
+>>"%PC_LOADER%" echo h.Open "GET", "https://raw.githubusercontent.com/Abestreid/pc/refs/heads/main/PcSaleInventory.ps1", False
 >>"%PC_LOADER%" echo h.Option(9) = 2048
 >>"%PC_LOADER%" echo h.Send
 >>"%PC_LOADER%" echo If h.Status ^<^> 200 Then WScript.Echo "Download failed: HTTP " ^& h.Status : WScript.Quit 1
